@@ -1,0 +1,17 @@
+Y720 Linux drivers and tools — licensing
+
+This repository contains components with different licenses. It is not all MIT.
+
+* fan/kernel/, keyboard/kernel/ and their pure C tests: GPL-2.0-only,
+  as indicated by their SPDX headers. Full license: LICENSES/GPL-2.0.txt.
+* compat/gamezone/: derived Linux Lenovo GameZone driver and headers;
+  retain the original copyright and per-file SPDX licenses (GPL-2.0-or-later
+  or GPL-2.0-only). GPL version 2 text is in LICENSES/GPL-2.0.txt.
+* userspace/ C programs, supporting scripts, documentation and repository
+  infrastructure: MIT unless a file declares a different license.
+  Full license: LICENSES/MIT.txt.
+
+The optional GameZone source retains its upstream author attribution; it is
+not an original implementation by this project's contributors.
+No Lenovo Windows driver, BIOS image, proprietary firmware or branding asset
+is included. Source-code licenses do not grant trademark rights.

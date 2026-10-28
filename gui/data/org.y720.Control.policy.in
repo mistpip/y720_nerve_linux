@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
+<policyconfig>
+  <vendor>Y720</vendor>
+  <action id="org.y720.control.fan">
+    <description>Control the Y720 fan</description>
+    <message>Authentication is required to control the Y720 fan</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@BINDIR@/y720-fan</annotate>
+  </action>
+  <action id="org.y720.control.backlight">
+    <description>Control the Y720 keyboard backlight</description>
+    <message>Authentication is required to control the Y720 keyboard backlight</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@BINDIR@/y720-backlight</annotate>
+  </action>
+</policyconfig>

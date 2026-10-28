@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "effect": "static",
+  "colors": ["red", "blue", "green", "white"],
+  "brightness": [3, 3, 3, 3]
+}

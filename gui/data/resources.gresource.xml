@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/org/y720/Control">
+    <file>style.css</file>
+    <file>icons/org.y720.Control.png</file>
+    <file>icons/tray-active-48.png</file>
+    <file>icons/tray-active-32.png</file>
+    <file>icons/tray-idle-48.png</file>
+    <file>icons/tray-idle-32.png</file>
+  </gresource>
+</gresources>

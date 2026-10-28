@@ -1,0 +1,31 @@
+# Generated user programs and kernel modules
+**/build/
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.cmd
+.*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
+__pycache__/
+*.pyc
+*.plist
+*.log
+*.zip
+*.tar.gz
+# Local configuration and credentials must not be published
+.env
+*.key
+*.pem
+*.p12
+mirror-backup/
+evidence/
+outputs/
+research/
+
+# Package output and GUI build
+/build/
+/gui/build/
+/dist/

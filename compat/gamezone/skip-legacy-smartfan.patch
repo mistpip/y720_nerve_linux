@@ -1,0 +1,21 @@
+--- a/drivers/platform/x86/lenovo/wmi-gamezone.c
++++ b/drivers/platform/x86/lenovo/wmi-gamezone.c
+@@ -357,6 +357,18 @@
+ 	struct lwmi_gz_priv *priv;
+ 	int ret;
+ 
++	/* This inspected legacy firmware implements WMAA methods 1..30 only.
++	 * Do not register platform_profile, whose probe evaluates SmartFan 43.
++	 * Leave the GUID available for a separate legacy cooling driver.
++	 */
++	if (dmi_match(DMI_SYS_VENDOR, "LENOVO") &&
++	    dmi_match(DMI_PRODUCT_NAME, "80Y4") &&
++	    dmi_match(DMI_PRODUCT_VERSION, "Y720-15IKB") &&
++	    dmi_match(DMI_BIOS_VERSION, "4GCN38WW")) {
++		dev_info(&wdev->dev, "Legacy Y720 firmware lacks SmartFan platform profiles; skipping\n");
++		return -ENODEV;
++	}
++
+ 	priv = devm_kzalloc(&wdev->dev, sizeof(*priv), GFP_KERNEL);
+ 	if (!priv)
+ 		return -ENOMEM;

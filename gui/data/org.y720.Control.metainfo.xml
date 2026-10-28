@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.y720.Control</id>
+  <name>Y720 Nerve Center</name>
+  <summary>Fan and keyboard backlight control for the Lenovo Y720</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>A small control panel for the Lenovo Y720-15IKB fan and four-zone keyboard backlight.</p>
+    <p>It calls the y720-fan and y720-backlight command line tools; it does not access hardware directly.</p>
+  </description>
+  <url type="homepage">https://github.com/doublepama10/y720_nerve_linux</url>
+  <launchable type="desktop-id">org.y720.Control.desktop</launchable>
+  <provides><binary>y720-control</binary></provides>
+  <releases><release version="0.1.0" date="2026-10-28"/></releases>
+</component>
