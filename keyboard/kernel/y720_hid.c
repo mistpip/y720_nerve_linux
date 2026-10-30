@@ -327,7 +327,7 @@ static const struct hid_device_id y720_ids[] = {
 	{ HID_USB_DEVICE(0x048d, 0xc100) },
 	{ }
 };
-/* Deliberate loading only: no autoload alias in this experimental package. */
+MODULE_DEVICE_TABLE(hid, y720_ids);
 
 static struct hid_driver y720_driver = {
 	.name = "y720-hid",
@@ -348,4 +348,4 @@ module_hid_driver(y720_driver);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Y720 Linux experimental port");
 MODULE_DESCRIPTION("Verified Y720 048d:c100 special-key mappings, no firmware writes");
-MODULE_VERSION("0.1");
+MODULE_VERSION(Y720_VERSION);

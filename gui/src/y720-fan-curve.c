@@ -17,7 +17,7 @@ static void point_xy(Y720FanCurve *self, gint width, gint height, guint i,
                      gdouble *x, gdouble *y)
 {
     (void)self;
-    const gdouble left = 38, right = 14, top = 14, bottom = 28;
+    const gdouble left = 58, right = 22, top = 24, bottom = 46;
     gdouble w = width - left - right;
     gdouble h = height - top - bottom;
     *x = left + w * i / (Y720_FAN_CURVE_POINTS - 1);
@@ -29,17 +29,16 @@ static void draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpoin
 {
     (void)area;
     Y720FanCurve *self = Y720_FAN_CURVE(user_data);
-    const gdouble left = 38, right = 14, top = 14, bottom = 28;
+    const gdouble left = 58, right = 22, top = 24, bottom = 46;
     gdouble w = width - left - right;
     gdouble h = height - top - bottom;
 
-    cairo_set_source_rgba(cr, 0.10, 0.10, 0.12, 0.85);
-    cairo_rectangle(cr, left, top, w, h);
-    cairo_fill(cr);
+    GdkRGBA fg = {0.5, 0.5, 0.5, 1.0};
+    gtk_widget_get_color(GTK_WIDGET(self), &fg);
 
     cairo_set_line_width(cr, 1);
-    cairo_set_source_rgba(cr, 1, 1, 1, 0.10);
-    for (gint rpm = 1500; rpm <= 5100; rpm += 600) {
+    cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, 0.12);
+    for (gint rpm = 1500; rpm <= 5100; rpm += 1200) {
         gdouble y = top + h * (1.0 - (rpm - 1500) / 3600.0);
         cairo_move_to(cr, left, y);
         cairo_line_to(cr, left + w, y);
@@ -52,7 +51,14 @@ static void draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpoin
         cairo_stroke(cr);
     }
 
-    cairo_set_source_rgba(cr, 0.85, 0.15, 0.22, 1.0);
+    cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, 0.45);
+    cairo_set_line_width(cr, 1.2);
+    cairo_move_to(cr, left, top);
+    cairo_line_to(cr, left, top + h);
+    cairo_line_to(cr, left + w, top + h);
+    cairo_stroke(cr);
+
+    cairo_set_source_rgba(cr, 0.75, 0.12, 0.18, 1.0);
     cairo_set_line_width(cr, 2.4);
     for (guint i = 0; i < Y720_FAN_CURVE_POINTS; i++) {
         gdouble x, y;
@@ -71,23 +77,43 @@ static void draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpoin
     }
 
     cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 10);
-    cairo_set_source_rgba(cr, 1, 1, 1, 0.55);
+    cairo_set_font_size(cr, 9);
+    cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, 0.65);
     for (guint i = 0; i < Y720_FAN_CURVE_POINTS; i++) {
         gchar label[16];
-        g_snprintf(label, sizeof(label), "%d°", temperatures[i]);
+        g_snprintf(label, sizeof(label), "%d", temperatures[i]);
         cairo_text_extents_t ext;
         cairo_text_extents(cr, label, &ext);
         gdouble x = left + w * i / (Y720_FAN_CURVE_POINTS - 1);
-        cairo_move_to(cr, x - ext.width / 2.0, top + h + 18);
+        cairo_move_to(cr, x - ext.width / 2.0, top + h + 17);
         cairo_show_text(cr, label);
     }
-    gchar top_label[16];
-    g_snprintf(top_label, sizeof(top_label), "5100");
-    cairo_move_to(cr, 2, top + 4);
-    cairo_show_text(cr, top_label);
-    cairo_move_to(cr, 2, top + h);
-    cairo_show_text(cr, "1500");
+    for (gint rpm = 1500; rpm <= 5100; rpm += 1200) {
+        gchar label[16];
+        g_snprintf(label, sizeof(label), "%d", rpm);
+        cairo_text_extents_t ext;
+        cairo_text_extents(cr, label, &ext);
+        gdouble y = top + h * (1.0 - (rpm - 1500) / 3600.0);
+        cairo_move_to(cr, left - 8 - ext.width, y + ext.height / 2.0);
+        cairo_show_text(cr, label);
+    }
+
+    cairo_set_font_size(cr, 10);
+    cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, 0.75);
+    const gchar *x_title = "Temperature (°C)";
+    cairo_text_extents_t ext;
+    cairo_text_extents(cr, x_title, &ext);
+    cairo_move_to(cr, left + (w - ext.width) / 2.0, height - 10);
+    cairo_show_text(cr, x_title);
+
+    cairo_save(cr);
+    cairo_translate(cr, 12, top + h / 2.0);
+    cairo_rotate(cr, -M_PI / 2.0);
+    const gchar *y_title = "Fan speed (RPM)";
+    cairo_text_extents(cr, y_title, &ext);
+    cairo_move_to(cr, -ext.width / 2.0, 0);
+    cairo_show_text(cr, y_title);
+    cairo_restore(cr);
 }
 
 static void on_drag(GtkGestureDrag *gesture, gdouble offset_x, gdouble offset_y,
@@ -100,7 +126,7 @@ static void on_drag(GtkGestureDrag *gesture, gdouble offset_x, gdouble offset_y,
     gdouble x = start_x + offset_x;
     gint width = gtk_widget_get_width(area);
     gint height = gtk_widget_get_height(area);
-    const gdouble left = 38, right = 14, top = 14, bottom = 28;
+    const gdouble left = 58, right = 22, top = 24, bottom = 46;
     gdouble w = width - left - right;
     gdouble h = height - top - bottom;
     gint nearest = 0;
@@ -113,7 +139,9 @@ static void on_drag(GtkGestureDrag *gesture, gdouble offset_x, gdouble offset_y,
     gdouble y = start_y + offset_y;
     gdouble t = 1.0 - (y - top) / h;
     gint rpm = (gint)((1500 + t * 3600.0) / 100.0 + 0.5) * 100;
-    self->rpms[nearest] = CLAMP(rpm, 1500, 5100);
+    gint low = nearest ? self->rpms[nearest - 1] : 1500;
+    gint high = nearest + 1 < Y720_FAN_CURVE_POINTS ? self->rpms[nearest + 1] : 5100;
+    self->rpms[nearest] = CLAMP(rpm, low, high);
     self->selected = nearest;
     gtk_widget_queue_draw(area);
     if (self->callback)

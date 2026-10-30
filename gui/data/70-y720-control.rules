@@ -1,0 +1,3 @@
+# Give the active seat user access to the Y720 I2C-HID backlight node.
+SUBSYSTEM=="hidraw", KERNELS=="0018:048D:837A.*", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event[0-9]*", ATTRS{name}=="ITE Tech. Inc. ITE Device(8910) Keyboard", ATTRS{id/bustype}=="0003", ATTRS{id/vendor}=="048d", ATTRS{id/product}=="c100", ATTRS{id/version}=="0110", TAG+="uaccess"

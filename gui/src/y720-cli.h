@@ -36,6 +36,7 @@ void y720_cli_run(const gchar *binary,
                   const gchar *input,
                   guint timeout_seconds,
                   GCancellable *cancellable,
+                  GObject *owner,
                   Y720CliCallback callback,
                   gpointer user_data);
 
@@ -44,9 +45,12 @@ void y720_cli_run_elevated(const gchar *binary,
                             const gchar *input,
                             guint timeout_seconds,
                             GCancellable *cancellable,
+                            GObject *owner,
                             Y720CliCallback callback,
                             gpointer user_data);
 gboolean y720_cli_can_elevate(const gchar *binary);
+void y720_cli_cancel_all(void);
+gboolean y720_cli_has_pending(void);
 
 void y720_result_free(Y720Result *result);
 const gchar *y720_cli_error_hint(const gchar *code);

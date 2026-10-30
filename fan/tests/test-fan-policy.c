@@ -5,6 +5,7 @@
 
 int main(void)
 {
+
 	unsigned int pwm, rpm, previous = 0;
 	for (pwm = 0; pwm <= 255; pwm++) {
 		rpm = y720_pwm_to_rpm(pwm);
@@ -34,20 +35,34 @@ int main(void)
 	assert(y720_cpu_health(121000) == Y720_TEMP_INVALID);
 	assert(y720_cpu_health(84999) == Y720_TEMP_OK);
 	assert(y720_cpu_health(85000) == Y720_TEMP_HOT);
-	assert(y720_gpu_health(0, 0, 0, 255, 255) == Y720_TEMP_OK);
-	assert(y720_gpu_health(1, 0, 0, 0, 0) == Y720_TEMP_INVALID);
-	assert(y720_gpu_health(1, 40, 40, 2, 0) == Y720_TEMP_INVALID);
-	assert(y720_gpu_health(1, 40, 40, 0, 1) == Y720_TEMP_INVALID);
-	assert(y720_gpu_health(1, 255, 40, 0, 0) == Y720_TEMP_INVALID);
-	assert(y720_gpu_health(1, 79, 79, 0, 0) == Y720_TEMP_OK);
-	assert(y720_gpu_health(1, 80, 79, 0, 0) == Y720_TEMP_HOT);
-	assert(y720_gpu_health(1, 79, 80, 0, 0) == Y720_TEMP_HOT);
+
 	assert(y720_tach_transient(0, 0));
 	assert(y720_tach_transient(999, 4));
 	assert(!y720_tach_transient(1000, 0));
 	assert(!y720_tach_transient(0, 5));
 	assert(!y720_tach_transient(0, 100));
 	assert(Y720_RAMP_SECONDS < Y720_TARGET_INTERVAL_SECONDS);
+	unsigned int points[Y720_CURVE_POINTS] = {1500, 1800, 2400, 3200, 4200, 5100};
+	assert(y720_curve_valid(points));
+	for (int temp = -1000; temp <= 121000; temp++) {
+		unsigned int state = y720_thermal_state(temp);
+		assert(state <= Y720_THERMAL_STATES);
+		rpm = y720_curve_rpm(points, temp);
+		assert(rpm >= 1500 && rpm <= 5100 && !(rpm % 100));
+		if (temp > -1000) assert(rpm >= previous);
+		previous = rpm;
+	}
+	assert(y720_curve_rpm(points, 55000) == 2100);
+	assert(y720_curve_rpm(points, 70000) == 3200);
+	points[0] = 5100;
+	assert(!y720_curve_valid(points)); /* More cooling state may never mean less RPM. */
+	for (unsigned int i = 0; i < Y720_CURVE_POINTS; i++) points[i] = 5100;
+	assert(y720_curve_valid(points));
+	assert(y720_curve_rpm(points, 10000) == 5100); /* Full speed is not temperature-gated. */
+	for (unsigned int i = 0; i < Y720_CURVE_POINTS; i++) points[i] = 1500;
+	assert(y720_curve_valid(points) && y720_curve_rpm(points, 120000) == 1500);
+	points[2] = 1501;
+	assert(!y720_curve_valid(points));
 	puts("PASS: all 256 PWM values, RPM rounding and endpoint round trips");
 	return 0;
 }

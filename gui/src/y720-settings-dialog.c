@@ -1,17 +1,17 @@
 /* SPDX-License-Identifier: MIT */
 #include "y720-settings-dialog.h"
-
-#include <adwaita.h>
+#include "y720-evdev.h"
+#include "y720-hotkeys.h"
+#include <linux/input.h>
+#include "y720-i18n.h"
 
 typedef struct {
     Y720Settings *settings;
-    GtkWindow *window;
-    GtkWidget *banner;
-    GtkWidget *autostart_row;
-    GtkWidget *close_row;
-    GtkWidget *background_row;
-    GtkWidget *shortcut_button;
+    GtkWindow *parent;
+    GtkWidget *profile_button;
     GtkWidget *boost_button;
+    GtkWidget *background_row;
+    AdwPreferencesDialog *window;
     Y720AppearanceChangedFunc changed;
     gpointer changed_data;
     Y720ShortcutChangedFunc shortcut_changed;
@@ -19,87 +19,131 @@ typedef struct {
     Y720CurveChangedFunc curve_changed;
     gpointer curve_data;
     gboolean updating;
+    AdwSwitchRow *global_row;
+    guint shortcut_status_timer;
 } Dialog;
-
-static void dialog_free(gpointer data)
-{
-    g_free(data);
-}
-
-static void save_settings(Dialog *dialog)
-{
-    y720_settings_save(dialog->settings);
-}
-
-static void notify_appearance(Dialog *dialog)
-{
-    if (dialog->changed)
-        dialog->changed(dialog->changed_data);
-}
-
-static gchar *rgba_hex(const GdkRGBA *rgba)
-{
-    return g_strdup_printf("#%02x%02x%02x",
-                           (gint)(CLAMP(rgba->red, 0.0, 1.0) * 255.0 + 0.5),
-                           (gint)(CLAMP(rgba->green, 0.0, 1.0) * 255.0 + 0.5),
-                           (gint)(CLAMP(rgba->blue, 0.0, 1.0) * 255.0 + 0.5));
-}
-
-static void update_background_row(Dialog *dialog)
-{
-    const gchar *path = dialog->settings->background_path;
-    gchar *name = path && *path ? g_path_get_basename(path) : NULL;
-    adw_action_row_set_subtitle(ADW_ACTION_ROW(dialog->background_row),
-                                name ? name : "未选择");
-    gtk_widget_set_tooltip_text(dialog->background_row, path && *path ? path : NULL);
-    g_free(name);
-}
-
-static void banner_error(Dialog *dialog, const gchar *message)
-{
-    adw_banner_set_title(ADW_BANNER(dialog->banner), message);
-    adw_banner_set_revealed(ADW_BANNER(dialog->banner), TRUE);
-}
 
 static gchar *pretty_accel(const gchar *accel)
 {
     guint key = 0;
     GdkModifierType mods = 0;
+
     if (!accel || !*accel)
-        return g_strdup("未设置");
+        return g_strdup(y720_tr("未设置"));
+    if (g_str_has_prefix(accel, "keycode:"))
+        return g_strdup_printf(y720_tr("键码 %s"), accel + 8);
+    if (g_strcmp0(accel, "evdev:228") == 0)
+        return g_strdup(y720_tr("Fn+空格"));
+    if (g_strcmp0(accel, "evdev:148") == 0)
+        return g_strdup(y720_tr("小键盘 7（NumLock 关闭）"));
+    if (g_strcmp0(accel, "space") == 0)
+        return g_strdup(y720_tr("空格"));
+    if (g_str_has_prefix(accel, "evdev:"))
+        return g_strdup_printf(y720_tr("键码 %s"), accel + 6);
     gtk_accelerator_parse(accel, &key, &mods);
     if (!key)
-        return g_strdup(accel);
+        return g_strdup(y720_tr("未设置"));
     return gtk_accelerator_get_label(key, mods);
 }
 
-static void update_shortcut_button(Dialog *dialog)
+static void update_buttons(Dialog *dialog)
 {
-    if (dialog->shortcut_button) {
-        gchar *pretty = pretty_accel(dialog->settings->profile_hotkey);
-        gtk_button_set_label(GTK_BUTTON(dialog->shortcut_button), pretty);
-        g_free(pretty);
-    }
-    if (dialog->boost_button) {
-        gchar *pretty = pretty_accel(dialog->settings->boost_hotkey);
-        gtk_button_set_label(GTK_BUTTON(dialog->boost_button), pretty);
-        g_free(pretty);
-    }
+    gchar *text;
+
+    text = pretty_accel(dialog->settings->profile_hotkey);
+    gtk_button_set_label(GTK_BUTTON(dialog->profile_button), text);
+    g_free(text);
+
+    text = pretty_accel(dialog->settings->boost_hotkey);
+    gtk_button_set_label(GTK_BUTTON(dialog->boost_button), text);
+    g_free(text);
 }
 
 typedef struct {
     Dialog *dialog;
     GtkWidget *window;
     gboolean boost;
+    guint pending_code;
+    guint pending_timeout;
+    GObject *dialog_owner;
 } Capture;
+
+static void cancel_pending(Capture *capture)
+{
+    if (capture->pending_timeout) {
+        g_source_remove(capture->pending_timeout);
+        capture->pending_timeout = 0;
+    }
+}
+
+static void capture_free(gpointer data)
+{
+    Capture *capture = data;
+    cancel_pending(capture);
+    y720_evdev_capture_stop();
+    if (capture->dialog->shortcut_changed)
+        capture->dialog->shortcut_changed(capture->dialog->shortcut_data);
+    g_clear_object(&capture->dialog_owner);
+    g_free(capture);
+}
+
+static void finish_capture(Capture *capture, const gchar *accel)
+{
+    Dialog *dialog = capture->dialog;
+    cancel_pending(capture);
+    if (capture->boost) {
+        g_free(dialog->settings->boost_hotkey);
+        dialog->settings->boost_hotkey = g_strdup(accel);
+    } else {
+        g_free(dialog->settings->profile_hotkey);
+        dialog->settings->profile_hotkey = g_strdup(accel);
+    }
+    y720_settings_normalize_shortcuts(dialog->settings);
+    y720_settings_save(dialog->settings);
+    update_buttons(dialog);
+    gtk_window_destroy(GTK_WINDOW(capture->window));
+}
+
+static gboolean commit_evdev(gpointer user_data)
+{
+    Capture *capture = user_data;
+    capture->pending_timeout = 0;
+    gchar *accel = g_strdup_printf("evdev:%u", capture->pending_code);
+    finish_capture(capture, accel);
+    g_free(accel);
+    return G_SOURCE_REMOVE;
+}
+
+static void on_evdev_key(guint code, gpointer user_data)
+{
+    Capture *capture = user_data;
+    if (code == KEY_KBDILLUMTOGGLE) {
+        finish_capture(capture, "evdev:228");
+        return;
+    }
+    switch (code) {
+    case KEY_LEFTCTRL: case KEY_RIGHTCTRL:
+    case KEY_LEFTSHIFT: case KEY_RIGHTSHIFT:
+    case KEY_LEFTALT: case KEY_RIGHTALT:
+    case KEY_LEFTMETA: case KEY_RIGHTMETA:
+    case KEY_FN:
+        return;
+    default:
+        break;
+    }
+    capture->pending_code = code;
+    cancel_pending(capture);
+    capture->pending_timeout = g_timeout_add(80, commit_evdev, capture);
+}
 
 static gboolean capture_key(GtkEventControllerKey *controller, guint keyval,
                             guint keycode, GdkModifierType state, gpointer user_data)
 {
-    (void)keycode;
     GtkWidget *window = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(controller));
     Capture *capture = user_data;
-    Dialog *dialog = capture->dialog;
+    GdkModifierType mods = state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK |
+                                    GDK_ALT_MASK | GDK_SUPER_MASK);
+
     if (keyval == GDK_KEY_Escape) {
         gtk_window_destroy(GTK_WINDOW(window));
         return TRUE;
@@ -110,45 +154,39 @@ static gboolean capture_key(GtkEventControllerKey *controller, guint keyval,
         keyval == GDK_KEY_Super_L || keyval == GDK_KEY_Super_R)
         return FALSE;
 
-    GdkModifierType mods = state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK |
-                                    GDK_ALT_MASK | GDK_SUPER_MASK);
-    if (!(mods & (GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SUPER_MASK)))
-        return FALSE;
+    cancel_pending(capture);
+    gchar *accel;
+    if (keyval == GDK_KEY_KbdLightOnOff ||
+        (keyval == GDK_KEY_space && mods == 0 && keycode == 236))
+        accel = g_strdup("evdev:228");
+    else
+        accel = keyval ? gtk_accelerator_name(keyval, mods) :
+                         g_strdup_printf("keycode:%u", keycode);
 
-    gchar *accel = gtk_accelerator_name(keyval, mods);
-    if (capture->boost) {
-        g_free(dialog->settings->boost_hotkey);
-        dialog->settings->boost_hotkey = accel;
-    } else {
-        g_free(dialog->settings->profile_hotkey);
-        dialog->settings->profile_hotkey = accel;
-    }
-    save_settings(dialog);
-    update_shortcut_button(dialog);
-    if (dialog->shortcut_changed)
-        dialog->shortcut_changed(dialog->shortcut_data);
-    gtk_window_destroy(GTK_WINDOW(window));
+    finish_capture(capture, accel);
+    g_free(accel);
     return TRUE;
 }
 
-static void on_edit_shortcut(GtkButton *button, gpointer user_data)
+static void on_capture_clicked(GtkButton *button, gpointer user_data)
 {
     Dialog *dialog = user_data;
     Capture *capture = g_new0(Capture, 1);
     capture->dialog = dialog;
+    capture->dialog_owner = g_object_ref(G_OBJECT(dialog->window));
     capture->boost = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "boost"));
+
     GtkWidget *window = adw_window_new();
     capture->window = window;
     gtk_window_set_title(GTK_WINDOW(window), capture->boost ? "极致散热" : "切换灯光方案");
     gtk_window_set_modal(GTK_WINDOW(window), TRUE);
-    gtk_window_set_transient_for(GTK_WINDOW(window), dialog->window);
-    gtk_window_set_default_size(GTK_WINDOW(window), 360, 170);
+    gtk_window_set_transient_for(GTK_WINDOW(window), dialog->parent);
+    gtk_window_set_destroy_with_parent(GTK_WINDOW(window), TRUE);
+    gtk_window_set_default_size(GTK_WINDOW(window), 340, 150);
 
     GtkWidget *toolbar = adw_toolbar_view_new();
-    GtkWidget *header = adw_header_bar_new();
-    adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(toolbar), header);
-    GtkWidget *label = gtk_label_new("按下新的快捷键\n需要 Ctrl、Alt 或 Super");
-    gtk_label_set_justify(GTK_LABEL(label), GTK_JUSTIFY_CENTER);
+    adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(toolbar), adw_header_bar_new());
+    GtkWidget *label = gtk_label_new("按下新的快捷键");
     gtk_widget_set_margin_top(label, 24);
     gtk_widget_set_margin_bottom(label, 24);
     adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(toolbar), label);
@@ -158,101 +196,16 @@ static void on_edit_shortcut(GtkButton *button, gpointer user_data)
     gtk_event_controller_set_propagation_phase(keys, GTK_PHASE_CAPTURE);
     g_signal_connect(keys, "key-pressed", G_CALLBACK(capture_key), capture);
     gtk_widget_add_controller(window, keys);
-    g_object_set_data_full(G_OBJECT(window), "capture", capture, g_free);
-    gtk_window_present(GTK_WINDOW(window));
-}
-
-static void on_background_chosen(GObject *source, GAsyncResult *result, gpointer user_data)
-{
-    Dialog *dialog = user_data;
+    g_object_set_data_full(G_OBJECT(window), "capture", capture, capture_free);
+    /* Stop both X11 grabs and Wayland portal actions while recording. */
+    y720_hotkeys_stop();
     GError *error = NULL;
-    GFile *file = gtk_file_dialog_open_finish(GTK_FILE_DIALOG(source), result, &error);
-    if (!file) {
-        if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-            banner_error(dialog, error->message);
+    if (!y720_evdev_capture_start(on_evdev_key, capture, &error)) {
+        gtk_label_set_text(GTK_LABEL(label), "无法读取 Fn+空格，请检查输入设备权限");
         g_clear_error(&error);
-        return;
     }
-    gchar *path = g_file_get_path(file);
-    g_object_unref(file);
-    if (!path)
-        return;
-    g_free(dialog->settings->background_path);
-    dialog->settings->background_path = path;
-    save_settings(dialog);
-    update_background_row(dialog);
-    notify_appearance(dialog);
-}
-
-static void on_choose_background(GtkButton *button, gpointer user_data)
-{
-    (void)button;
-    Dialog *dialog = user_data;
-    GtkFileDialog *file_dialog = gtk_file_dialog_new();
-    gtk_file_dialog_set_title(file_dialog, "选择背景图片");
-    GtkFileFilter *filter = gtk_file_filter_new();
-    gtk_file_filter_set_name(filter, "图片");
-    gtk_file_filter_add_pattern(filter, "*.png");
-    gtk_file_filter_add_pattern(filter, "*.jpg");
-    gtk_file_filter_add_pattern(filter, "*.jpeg");
-    gtk_file_filter_add_pattern(filter, "*.webp");
-    gtk_file_filter_add_pattern(filter, "*.bmp");
-    gtk_file_filter_add_pattern(filter, "*.gif");
-    GListStore *filters = g_list_store_new(GTK_TYPE_FILE_FILTER);
-    g_list_store_append(filters, filter);
-    gtk_file_dialog_set_filters(file_dialog, G_LIST_MODEL(filters));
-    gtk_file_dialog_open(file_dialog, dialog->window, NULL, on_background_chosen, dialog);
-    g_object_unref(filters);
-    g_object_unref(filter);
-    g_object_unref(file_dialog);
-}
-
-static void on_clear_background(GtkButton *button, gpointer user_data)
-{
-    (void)button;
-    Dialog *dialog = user_data;
-    g_clear_pointer(&dialog->settings->background_path, g_free);
-    save_settings(dialog);
-    update_background_row(dialog);
-    notify_appearance(dialog);
-}
-
-static void on_background_opacity(GtkRange *range, gpointer user_data)
-{
-    Dialog *dialog = user_data;
-    dialog->settings->background_opacity = gtk_range_get_value(range) / 100.0;
-    save_settings(dialog);
-    notify_appearance(dialog);
-}
-
-static void on_panel_opacity(GtkRange *range, gpointer user_data)
-{
-    Dialog *dialog = user_data;
-    dialog->settings->panel_opacity = gtk_range_get_value(range) / 100.0;
-    save_settings(dialog);
-    notify_appearance(dialog);
-}
-
-static void on_window_opacity(GtkRange *range, gpointer user_data)
-{
-    Dialog *dialog = user_data;
-    dialog->settings->window_opacity = gtk_range_get_value(range) / 100.0;
-    save_settings(dialog);
-    notify_appearance(dialog);
-}
-
-static void on_accent_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
-{
-    (void)pspec;
-    Dialog *dialog = user_data;
-    const GdkRGBA *rgba = gtk_color_dialog_button_get_rgba(GTK_COLOR_DIALOG_BUTTON(object));
-    if (!rgba)
-        return;
-    gchar *hex = rgba_hex(rgba);
-    g_free(dialog->settings->accent);
-    dialog->settings->accent = hex;
-    save_settings(dialog);
-    notify_appearance(dialog);
+    y720_i18n_apply(window);
+    gtk_window_present(GTK_WINDOW(window));
 }
 
 static void on_autostart_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
@@ -264,8 +217,8 @@ static void on_autostart_changed(GObject *object, GParamSpec *pspec, gpointer us
     gboolean active = adw_switch_row_get_active(ADW_SWITCH_ROW(object));
     GError *error = NULL;
     if (!y720_autostart_set(active, &error)) {
-        banner_error(dialog, error->message);
-        g_error_free(error);
+        g_warning("autostart: %s", error ? error->message : "unknown error");
+        g_clear_error(&error);
         dialog->updating = TRUE;
         adw_switch_row_set_active(ADW_SWITCH_ROW(object), !active);
         dialog->updating = FALSE;
@@ -276,47 +229,179 @@ static void on_start_hidden_changed(GObject *object, GParamSpec *pspec, gpointer
 {
     (void)pspec;
     Dialog *dialog = user_data;
-    if (dialog->updating)
-        return;
-    dialog->settings->start_hidden = adw_switch_row_get_active(ADW_SWITCH_ROW(object));
-    save_settings(dialog);
+    if (!dialog->updating) {
+        dialog->settings->start_hidden = adw_switch_row_get_active(ADW_SWITCH_ROW(object));
+        y720_settings_save(dialog->settings);
+    }
 }
 
 static void on_close_tray_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
 {
     (void)pspec;
     Dialog *dialog = user_data;
-    if (dialog->updating)
-        return;
-    dialog->settings->close_to_tray = adw_switch_row_get_active(ADW_SWITCH_ROW(object));
-    save_settings(dialog);
+    if (!dialog->updating) {
+        dialog->settings->close_to_tray = adw_switch_row_get_active(ADW_SWITCH_ROW(object));
+        y720_settings_save(dialog->settings);
+    }
 }
 
-static void on_curve_switch(GObject *object, GParamSpec *pspec, gpointer user_data)
+static void on_curve_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
 {
     (void)pspec;
     Dialog *dialog = user_data;
-    if (dialog->updating)
-        return;
-    dialog->settings->curve_enabled = adw_switch_row_get_active(ADW_SWITCH_ROW(object));
-    save_settings(dialog);
-    if (dialog->curve_changed)
-        dialog->curve_changed(dialog->curve_data);
+    if (!dialog->updating) {
+        dialog->settings->curve_enabled = adw_switch_row_get_active(ADW_SWITCH_ROW(object));
+        y720_settings_save(dialog->settings);
+        if (dialog->curve_changed)
+            dialog->curve_changed(dialog->curve_data);
+    }
 }
 
 static void on_hotkey_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
 {
     (void)pspec;
     Dialog *dialog = user_data;
-    if (dialog->updating)
-        return;
-    dialog->settings->global_hotkey = adw_switch_row_get_active(ADW_SWITCH_ROW(object));
-    save_settings(dialog);
-    if (dialog->shortcut_changed)
-        dialog->shortcut_changed(dialog->shortcut_data);
+    if (!dialog->updating) {
+        dialog->settings->global_hotkey = adw_switch_row_get_active(ADW_SWITCH_ROW(object));
+        y720_settings_save(dialog->settings);
+        if (dialog->shortcut_changed)
+            dialog->shortcut_changed(dialog->shortcut_data);
+    }
 }
 
-GtkWindow *y720_settings_dialog_show(GtkWindow *parent, Y720Settings *settings,
+static void notify_appearance(Dialog *dialog)
+{
+    if (dialog->changed)
+        dialog->changed(dialog->changed_data);
+}
+
+static void update_background_row(Dialog *dialog)
+{
+    const gchar *path = dialog->settings->background_path;
+    gchar *name = path && *path ? g_path_get_basename(path) : NULL;
+    adw_action_row_set_subtitle(ADW_ACTION_ROW(dialog->background_row),
+                                name ? name : y720_tr("未选择"));
+    gtk_widget_set_tooltip_text(dialog->background_row, path && *path ? path : NULL);
+    g_free(name);
+}
+
+static void on_background_opacity(GtkRange *range, gpointer user_data)
+{
+    Dialog *dialog = user_data;
+    dialog->settings->background_opacity = gtk_range_get_value(range) / 100.0;
+    y720_settings_save(dialog->settings);
+    notify_appearance(dialog);
+}
+
+static void on_panel_opacity(GtkRange *range, gpointer user_data)
+{
+    Dialog *dialog = user_data;
+    dialog->settings->panel_opacity = gtk_range_get_value(range) / 100.0;
+    y720_settings_save(dialog->settings);
+    notify_appearance(dialog);
+}
+
+static void on_window_opacity(GtkRange *range, gpointer user_data)
+{
+    Dialog *dialog = user_data;
+    dialog->settings->window_opacity = gtk_range_get_value(range) / 100.0;
+    y720_settings_save(dialog->settings);
+    notify_appearance(dialog);
+}
+
+static void on_background_chosen(GObject *source, GAsyncResult *result, gpointer user_data)
+{
+    Dialog *dialog = user_data;
+    GError *error = NULL;
+    GFile *file = gtk_file_dialog_open_finish(GTK_FILE_DIALOG(source), result, &error);
+    if (!file) {
+        g_clear_error(&error);
+        return;
+    }
+    gchar *path = g_file_get_path(file);
+    g_object_unref(file);
+    if (!path)
+        return;
+    g_free(dialog->settings->background_path);
+    dialog->settings->background_path = path;
+    y720_settings_save(dialog->settings);
+    update_background_row(dialog);
+    notify_appearance(dialog);
+}
+
+static void on_choose_background(GtkButton *button, gpointer user_data)
+{
+    (void)button;
+    Dialog *dialog = user_data;
+    GtkFileDialog *file_dialog = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(file_dialog, y720_tr("选择背景图片"));
+    GtkFileFilter *filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(filter, y720_tr("图片"));
+    gtk_file_filter_add_pattern(filter, "*.png");
+    gtk_file_filter_add_pattern(filter, "*.jpg");
+    gtk_file_filter_add_pattern(filter, "*.jpeg");
+    gtk_file_filter_add_pattern(filter, "*.webp");
+    GListStore *filters = g_list_store_new(GTK_TYPE_FILE_FILTER);
+    g_list_store_append(filters, filter);
+    gtk_file_dialog_set_filters(file_dialog, G_LIST_MODEL(filters));
+    gtk_file_dialog_open(file_dialog, dialog->parent, NULL, on_background_chosen, dialog);
+    g_object_unref(filters);
+    g_object_unref(filter);
+    g_object_unref(file_dialog);
+}
+
+static void on_clear_background(GtkButton *button, gpointer user_data)
+{
+    (void)button;
+    Dialog *dialog = user_data;
+    g_clear_pointer(&dialog->settings->background_path, g_free);
+    y720_settings_save(dialog->settings);
+    update_background_row(dialog);
+    notify_appearance(dialog);
+}
+
+static const gchar *language_values[] = {"auto", "zh_CN", "en"};
+
+static void on_language_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
+{
+    (void)pspec;
+    Dialog *dialog = user_data;
+    if (dialog->updating)
+        return;
+    guint index = adw_combo_row_get_selected(ADW_COMBO_ROW(object));
+    if (index > 2)
+        index = 0;
+    g_free(dialog->settings->language);
+    dialog->settings->language = g_strdup(language_values[index]);
+    y720_settings_save(dialog->settings);
+    y720_i18n_set_language(dialog->settings->language);
+    AdwToast *toast = adw_toast_new(y720_tr("重启程序后生效"));
+    adw_preferences_dialog_add_toast(dialog->window, toast);
+}
+
+static void dialog_free(gpointer data)
+{
+    Dialog *dialog = data;
+    if (dialog->shortcut_status_timer)
+        g_source_remove(dialog->shortcut_status_timer);
+    g_free(dialog);
+}
+
+static gboolean update_shortcut_status(gpointer data)
+{
+    Dialog *dialog = data;
+    g_autofree gchar *text = NULL;
+    if (!dialog->settings->global_hotkey)
+        text = g_strdup(y720_tr("全局快捷键已关闭"));
+    else
+        text = g_strdup_printf("%s\n%s", y720_hotkeys_status(),
+                                y720_tr(y720_evdev_active() ? "Y720 专用功能键可用" :
+                                   "Y720 专用功能键不可读，请检查活动会话与输入权限"));
+    adw_action_row_set_subtitle(ADW_ACTION_ROW(dialog->global_row), text);
+    return G_SOURCE_CONTINUE;
+}
+
+AdwDialog *y720_settings_dialog_show(GtkWindow *parent, Y720Settings *settings,
                                      gboolean tray_available, gboolean hotkey_ok,
                                      gboolean x11_session,
                                      Y720AppearanceChangedFunc changed,
@@ -326,8 +411,10 @@ GtkWindow *y720_settings_dialog_show(GtkWindow *parent, Y720Settings *settings,
                                      Y720CurveChangedFunc curve_changed,
                                      gpointer curve_data)
 {
+    (void)hotkey_ok; (void)x11_session;
     Dialog *dialog = g_new0(Dialog, 1);
     dialog->settings = settings;
+    dialog->parent = parent;
     dialog->changed = changed;
     dialog->changed_data = changed_data;
     dialog->shortcut_changed = shortcut_changed;
@@ -335,208 +422,134 @@ GtkWindow *y720_settings_dialog_show(GtkWindow *parent, Y720Settings *settings,
     dialog->curve_changed = curve_changed;
     dialog->curve_data = curve_data;
 
-    GtkWidget *window = adw_window_new();
-    dialog->window = GTK_WINDOW(window);
-    gtk_window_set_title(GTK_WINDOW(window), "设置");
-    gtk_window_set_default_size(GTK_WINDOW(window), 560, 620);
-    gtk_window_set_modal(GTK_WINDOW(window), TRUE);
-    gtk_window_set_transient_for(GTK_WINDOW(window), parent);
-    g_object_set_data_full(G_OBJECT(window), "y720-dialog", dialog, dialog_free);
+    AdwPreferencesDialog *prefs = ADW_PREFERENCES_DIALOG(adw_preferences_dialog_new());
+    dialog->window = prefs;
+    adw_dialog_set_title(ADW_DIALOG(prefs), "设置");
+    adw_preferences_dialog_set_search_enabled(prefs, FALSE);
+    g_object_set_data_full(G_OBJECT(prefs), "y720-dialog", dialog, dialog_free);
 
-    GtkWidget *toolbar = adw_toolbar_view_new();
-    GtkWidget *header = adw_header_bar_new();
-    adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(toolbar), header);
-    adw_window_set_content(ADW_WINDOW(window), toolbar);
+    AdwPreferencesPage *page = ADW_PREFERENCES_PAGE(adw_preferences_page_new());
+    adw_preferences_page_set_title(page, "设置");
+    adw_preferences_dialog_add(prefs, page);
 
-    GtkWidget *content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_widget_add_css_class(content, "dialog-shell");
-    adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(toolbar), content);
-
-    dialog->banner = adw_banner_new("设置");
-    gtk_box_append(GTK_BOX(content), dialog->banner);
-
-    GtkWidget *scrolled = gtk_scrolled_window_new();
-    gtk_widget_set_vexpand(scrolled, TRUE);
-    gtk_box_append(GTK_BOX(content), scrolled);
-
-    GtkWidget *page = adw_preferences_page_new();
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled), page);
-
-    AdwPreferencesGroup *general = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
-    adw_preferences_group_set_title(general, "常规");
-    adw_preferences_page_add(ADW_PREFERENCES_PAGE(page), general);
+    AdwPreferencesGroup *startup = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
+    adw_preferences_group_set_title(startup, "启动");
 
     AdwSwitchRow *autostart = ADW_SWITCH_ROW(adw_switch_row_new());
     adw_preferences_row_set_title(ADW_PREFERENCES_ROW(autostart), "开机自动启动");
-    adw_action_row_set_subtitle(ADW_ACTION_ROW(autostart), "登录时启动");
     adw_switch_row_set_active(autostart, y720_autostart_enabled());
     g_signal_connect(autostart, "notify::active", G_CALLBACK(on_autostart_changed), dialog);
-    adw_preferences_group_add(general, GTK_WIDGET(autostart));
+    adw_preferences_group_add(startup, GTK_WIDGET(autostart));
 
-    AdwSwitchRow *start_hidden = ADW_SWITCH_ROW(adw_switch_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(start_hidden), "启动时隐藏窗口");
-    adw_action_row_set_subtitle(ADW_ACTION_ROW(start_hidden), "只显示托盘");
-    adw_switch_row_set_active(start_hidden, settings->start_hidden);
-    g_signal_connect(start_hidden, "notify::active", G_CALLBACK(on_start_hidden_changed), dialog);
-    adw_preferences_group_add(general, GTK_WIDGET(start_hidden));
+    AdwSwitchRow *hidden = ADW_SWITCH_ROW(adw_switch_row_new());
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(hidden), "启动时隐藏窗口");
+    adw_switch_row_set_active(hidden, settings->start_hidden);
+    g_signal_connect(hidden, "notify::active", G_CALLBACK(on_start_hidden_changed), dialog);
+    adw_preferences_group_add(startup, GTK_WIDGET(hidden));
 
-    AdwSwitchRow *close_tray = ADW_SWITCH_ROW(adw_switch_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(close_tray), "在托盘区显示图标");
-    adw_action_row_set_subtitle(ADW_ACTION_ROW(close_tray),
-                                tray_available ? "关闭窗口后继续运行" : "无托盘支持");
-    adw_switch_row_set_active(close_tray, settings->close_to_tray);
-    gtk_widget_set_sensitive(GTK_WIDGET(close_tray), tray_available);
-    g_signal_connect(close_tray, "notify::active", G_CALLBACK(on_close_tray_changed), dialog);
-    adw_preferences_group_add(general, GTK_WIDGET(close_tray));
+    AdwSwitchRow *tray = ADW_SWITCH_ROW(adw_switch_row_new());
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(tray), "关闭窗口后留在托盘");
+    adw_switch_row_set_active(tray, settings->close_to_tray);
+    gtk_widget_set_sensitive(GTK_WIDGET(tray), tray_available);
+    g_signal_connect(tray, "notify::active", G_CALLBACK(on_close_tray_changed), dialog);
+    adw_preferences_group_add(startup, GTK_WIDGET(tray));
 
-    AdwActionRow *shortcut_row = ADW_ACTION_ROW(adw_action_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(shortcut_row), "切换灯光方案");
-    adw_action_row_set_subtitle(ADW_ACTION_ROW(shortcut_row), "点击后按新组合键");
-    dialog->shortcut_button = gtk_button_new();
-    gtk_widget_set_valign(dialog->shortcut_button, GTK_ALIGN_CENTER);
-    update_shortcut_button(dialog);
-    g_signal_connect(dialog->shortcut_button, "clicked", G_CALLBACK(on_edit_shortcut), dialog);
-    adw_action_row_add_suffix(shortcut_row, dialog->shortcut_button);
-    adw_preferences_group_add(general, GTK_WIDGET(shortcut_row));
+    AdwComboRow *language = ADW_COMBO_ROW(adw_combo_row_new());
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(language), "语言");
+    adw_action_row_set_subtitle(ADW_ACTION_ROW(language), "重启程序后生效");
+    const gchar *language_labels[] = {y720_tr("跟随系统"), "中文", "English", NULL};
+    GtkStringList *language_list = gtk_string_list_new(language_labels);
+    adw_combo_row_set_model(language, G_LIST_MODEL(language_list));
+    g_object_unref(language_list);
+    guint language_index = g_strcmp0(settings->language, "zh_CN") == 0 ? 1 :
+                           g_strcmp0(settings->language, "en") == 0 ? 2 : 0;
+    adw_combo_row_set_selected(language, language_index);
+    g_signal_connect(language, "notify::selected", G_CALLBACK(on_language_changed), dialog);
+    adw_preferences_group_add(startup, GTK_WIDGET(language));
 
-    AdwActionRow *boost_row = ADW_ACTION_ROW(adw_action_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(boost_row), "极致散热");
-    adw_action_row_set_subtitle(ADW_ACTION_ROW(boost_row), "点击后按新组合键");
+    adw_preferences_page_add(page, startup);
+
+    AdwPreferencesGroup *keys = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
+    adw_preferences_group_set_title(keys, "快捷键");
+
+    AdwActionRow *profile = ADW_ACTION_ROW(adw_action_row_new());
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(profile), "切换灯光方案");
+    dialog->profile_button = gtk_button_new();
+    gtk_widget_set_valign(dialog->profile_button, GTK_ALIGN_CENTER);
+    g_signal_connect(dialog->profile_button, "clicked", G_CALLBACK(on_capture_clicked), dialog);
+    adw_action_row_add_suffix(profile, dialog->profile_button);
+    adw_preferences_group_add(keys, GTK_WIDGET(profile));
+
+    AdwActionRow *boost = ADW_ACTION_ROW(adw_action_row_new());
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(boost), "极致散热");
     dialog->boost_button = gtk_button_new();
     gtk_widget_set_valign(dialog->boost_button, GTK_ALIGN_CENTER);
     g_object_set_data(G_OBJECT(dialog->boost_button), "boost", GINT_TO_POINTER(1));
-    update_shortcut_button(dialog);
-    g_signal_connect(dialog->boost_button, "clicked", G_CALLBACK(on_edit_shortcut), dialog);
-    adw_action_row_add_suffix(boost_row, dialog->boost_button);
-    adw_preferences_group_add(general, GTK_WIDGET(boost_row));
+    g_signal_connect(dialog->boost_button, "clicked", G_CALLBACK(on_capture_clicked), dialog);
+    adw_action_row_add_suffix(boost, dialog->boost_button);
+    adw_preferences_group_add(keys, GTK_WIDGET(boost));
 
+    AdwSwitchRow *global = ADW_SWITCH_ROW(adw_switch_row_new());
+    dialog->global_row = global;
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(global), "启用全局快捷键");
+    adw_switch_row_set_active(global, settings->global_hotkey);
+    update_shortcut_status(dialog);
+    dialog->shortcut_status_timer = g_timeout_add(250, update_shortcut_status, dialog);
+    g_signal_connect(global, "notify::active", G_CALLBACK(on_hotkey_changed), dialog);
+    adw_preferences_group_add(keys, GTK_WIDGET(global));
+
+    adw_preferences_page_add(page, keys);
+
+    AdwPreferencesGroup *fan = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
+    adw_preferences_group_set_title(fan, "风扇");
     AdwSwitchRow *curve = ADW_SWITCH_ROW(adw_switch_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(curve), "风扇曲线");
-    adw_action_row_set_subtitle(ADW_ACTION_ROW(curve), "显示曲线面板与托盘曲线入口");
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(curve), "启用风扇曲线");
     adw_switch_row_set_active(curve, settings->curve_enabled);
-    g_signal_connect(curve, "notify::active", G_CALLBACK(on_curve_switch), dialog);
-    adw_preferences_group_add(general, GTK_WIDGET(curve));
+    g_signal_connect(curve, "notify::active", G_CALLBACK(on_curve_changed), dialog);
+    adw_preferences_group_add(fan, GTK_WIDGET(curve));
+    adw_preferences_page_add(page, fan);
 
     AdwPreferencesGroup *appearance = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
     adw_preferences_group_set_title(appearance, "外观");
 
     AdwActionRow *background = ADW_ACTION_ROW(adw_action_row_new());
     adw_preferences_row_set_title(ADW_PREFERENCES_ROW(background), "背景图片");
-    GtkWidget *background_buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_widget_set_valign(background_buttons, GTK_ALIGN_CENTER);
+    GtkWidget *buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_valign(buttons, GTK_ALIGN_CENTER);
     GtkWidget *choose = gtk_button_new_with_label("选择…");
     GtkWidget *clear = gtk_button_new_from_icon_name("edit-clear-symbolic");
     gtk_widget_set_tooltip_text(clear, "清除背景");
-    gtk_box_append(GTK_BOX(background_buttons), choose);
-    gtk_box_append(GTK_BOX(background_buttons), clear);
-    adw_action_row_add_suffix(background, background_buttons);
-    adw_preferences_group_add(appearance, GTK_WIDGET(background));
+    gtk_box_append(GTK_BOX(buttons), choose);
+    gtk_box_append(GTK_BOX(buttons), clear);
+    adw_action_row_add_suffix(background, buttons);
     dialog->background_row = GTK_WIDGET(background);
     update_background_row(dialog);
     g_signal_connect(choose, "clicked", G_CALLBACK(on_choose_background), dialog);
     g_signal_connect(clear, "clicked", G_CALLBACK(on_clear_background), dialog);
+    adw_preferences_group_add(appearance, GTK_WIDGET(background));
 
-    AdwActionRow *bg_alpha_row = ADW_ACTION_ROW(adw_action_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(bg_alpha_row), "背景不透明度");
-    GtkWidget *bg_alpha = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 100, 1);
-    gtk_widget_set_size_request(bg_alpha, 220, -1);
-    gtk_scale_set_draw_value(GTK_SCALE(bg_alpha), TRUE);
-    gtk_scale_set_value_pos(GTK_SCALE(bg_alpha), GTK_POS_RIGHT);
-    gtk_scale_set_digits(GTK_SCALE(bg_alpha), 0);
-    gtk_range_set_value(GTK_RANGE(bg_alpha), settings->background_opacity * 100.0);
-    g_signal_connect(bg_alpha, "value-changed", G_CALLBACK(on_background_opacity), dialog);
-    adw_action_row_add_suffix(bg_alpha_row, bg_alpha);
-    adw_preferences_group_add(appearance, GTK_WIDGET(bg_alpha_row));
-
-    AdwActionRow *panel_alpha_row = ADW_ACTION_ROW(adw_action_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(panel_alpha_row), "面板不透明度");
-    GtkWidget *panel_alpha = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 35, 100, 1);
-    gtk_widget_set_size_request(panel_alpha, 220, -1);
-    gtk_scale_set_draw_value(GTK_SCALE(panel_alpha), TRUE);
-    gtk_scale_set_value_pos(GTK_SCALE(panel_alpha), GTK_POS_RIGHT);
-    gtk_scale_set_digits(GTK_SCALE(panel_alpha), 0);
-    gtk_range_set_value(GTK_RANGE(panel_alpha), settings->panel_opacity * 100.0);
-    g_signal_connect(panel_alpha, "value-changed", G_CALLBACK(on_panel_opacity), dialog);
-    adw_action_row_add_suffix(panel_alpha_row, panel_alpha);
-    adw_preferences_group_add(appearance, GTK_WIDGET(panel_alpha_row));
-
-    AdwActionRow *window_alpha_row = ADW_ACTION_ROW(adw_action_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(window_alpha_row), "窗口不透明度");
-    GtkWidget *window_alpha = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 50, 100, 1);
-    gtk_widget_set_size_request(window_alpha, 220, -1);
-    gtk_scale_set_draw_value(GTK_SCALE(window_alpha), TRUE);
-    gtk_scale_set_value_pos(GTK_SCALE(window_alpha), GTK_POS_RIGHT);
-    gtk_scale_set_digits(GTK_SCALE(window_alpha), 0);
-    gtk_range_set_value(GTK_RANGE(window_alpha), settings->window_opacity * 100.0);
-    g_signal_connect(window_alpha, "value-changed", G_CALLBACK(on_window_opacity), dialog);
-    adw_action_row_add_suffix(window_alpha_row, window_alpha);
-    adw_preferences_group_add(appearance, GTK_WIDGET(window_alpha_row));
-
-    AdwActionRow *accent_row = ADW_ACTION_ROW(adw_action_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(accent_row), "强调色");
-    GtkColorDialog *color_dialog = gtk_color_dialog_new();
-    gtk_color_dialog_set_title(color_dialog, "强调色");
-    GtkWidget *color_button = gtk_color_dialog_button_new(color_dialog);
-    GdkRGBA rgba;
-    if (!gdk_rgba_parse(&rgba, settings->accent ? settings->accent : "#c01c28"))
-        gdk_rgba_parse(&rgba, "#c01c28");
-    gtk_color_dialog_button_set_rgba(GTK_COLOR_DIALOG_BUTTON(color_button), &rgba);
-    gtk_widget_set_size_request(color_button, 48, 30);
-    gtk_widget_set_valign(color_button, GTK_ALIGN_CENTER);
-    g_signal_connect(color_button, "notify::rgba", G_CALLBACK(on_accent_changed), dialog);
-    adw_action_row_add_suffix(accent_row, color_button);
-    adw_preferences_group_add(appearance, GTK_WIDGET(accent_row));
-    g_object_set_data_full(G_OBJECT(color_button), "color-dialog", color_dialog,
-                           g_object_unref);
-
-    adw_preferences_page_add(ADW_PREFERENCES_PAGE(page), appearance);
-
-    AdwPreferencesGroup *keys = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
-    adw_preferences_group_set_title(keys, "快捷键");
-    adw_preferences_page_add(ADW_PREFERENCES_PAGE(page), keys);
-
-    AdwSwitchRow *hotkey = ADW_SWITCH_ROW(adw_switch_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(hotkey), "启用全局快捷键");
-    gchar *subtitle;
-    if (!x11_session)
-        subtitle = g_strdup("仅 X11 会话");
-    else if (!hotkey_ok)
-        subtitle = g_strdup("XWayland 或组合键被占用");
-    else
-        subtitle = g_strdup("X11 全局");
-    adw_action_row_set_subtitle(ADW_ACTION_ROW(hotkey), subtitle);
-    g_free(subtitle);
-    adw_switch_row_set_active(hotkey, settings->global_hotkey && x11_session);
-    gtk_widget_set_sensitive(GTK_WIDGET(hotkey), x11_session);
-    g_signal_connect(hotkey, "notify::active", G_CALLBACK(on_hotkey_changed), dialog);
-    adw_preferences_group_add(keys, GTK_WIDGET(hotkey));
-
-    const struct { const gchar *title; const gchar *accel; } shortcuts[] = {
-        {"显示 / 隐藏窗口", "托盘图标"},
-        {"切换极致散热页面", "Ctrl+1"},
-        {"切换幻彩地带页面", "Ctrl+2"},
-        {"刷新状态", "Ctrl+R"},
-        {"自动模式", "Ctrl+A"},
-        {"设置", "Ctrl+,"},
-        {"退出", "Ctrl+Q"},
+    struct { const gchar *title; gdouble value; gdouble min; gdouble max; GCallback cb; } sliders[] = {
+        {"背景不透明度", settings->background_opacity * 100.0, 0, 100, G_CALLBACK(on_background_opacity)},
+        {"面板不透明度", settings->panel_opacity * 100.0, 35, 100, G_CALLBACK(on_panel_opacity)},
+        {"窗口不透明度", settings->window_opacity * 100.0, 50, 100, G_CALLBACK(on_window_opacity)},
     };
-    for (guint i = 0; i < G_N_ELEMENTS(shortcuts); i++) {
+    for (guint i = 0; i < G_N_ELEMENTS(sliders); i++) {
         AdwActionRow *row = ADW_ACTION_ROW(adw_action_row_new());
-        adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), shortcuts[i].title);
-        GtkWidget *label = gtk_label_new(shortcuts[i].accel);
-        gtk_widget_add_css_class(label, "mono");
-        adw_action_row_add_suffix(row, label);
-        adw_preferences_group_add(keys, GTK_WIDGET(row));
+        adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), sliders[i].title);
+        GtkWidget *scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,
+                                                     sliders[i].min, sliders[i].max, 1);
+        gtk_widget_set_size_request(scale, 220, -1);
+        gtk_scale_set_draw_value(GTK_SCALE(scale), TRUE);
+        gtk_scale_set_value_pos(GTK_SCALE(scale), GTK_POS_RIGHT);
+        gtk_scale_set_digits(GTK_SCALE(scale), 0);
+        gtk_range_set_value(GTK_RANGE(scale), sliders[i].value);
+        g_signal_connect(scale, "value-changed", sliders[i].cb, dialog);
+        adw_action_row_add_suffix(row, scale);
+        adw_preferences_group_add(appearance, GTK_WIDGET(row));
     }
+    adw_preferences_page_add(page, appearance);
 
-    AdwPreferencesGroup *about = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
-    adw_preferences_group_set_title(about, "关于");
-    adw_preferences_page_add(ADW_PREFERENCES_PAGE(page), about);
-    AdwActionRow *version = ADW_ACTION_ROW(adw_action_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(version), "Y720 Nerve Center");
-    adw_action_row_set_subtitle(ADW_ACTION_ROW(version), "版本 " Y720_VERSION);
-    adw_preferences_group_add(about, GTK_WIDGET(version));
-
-    gtk_window_present(GTK_WINDOW(window));
-    return GTK_WINDOW(window);
+    update_buttons(dialog);
+    y720_i18n_apply(GTK_WIDGET(prefs));
+    return ADW_DIALOG(prefs);
 }

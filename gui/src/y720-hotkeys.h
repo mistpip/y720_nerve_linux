@@ -18,6 +18,8 @@ gboolean y720_hotkeys_start(const Y720HotkeyBinding *bindings, guint count,
                             GError **error);
 void y720_hotkeys_stop(void);
 gboolean y720_hotkeys_active(void);
+/* Returns the live ordinary-combination backend state, not input-device access. */
+const gchar *y720_hotkeys_status(void);
 
 G_END_DECLS
 

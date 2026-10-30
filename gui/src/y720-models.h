@@ -21,6 +21,14 @@ typedef struct {
     gint64 fan_rpm[2];
     gboolean diagnostic_present[Y720_FAN_DIAGNOSTIC_COUNT];
     gint64 diagnostic[Y720_FAN_DIAGNOSTIC_COUNT];
+    gboolean temperature_valid;
+    gint64 temperature_mc;
+    gchar *temperature_source;
+    gboolean kernel_curve_supported;
+    gboolean kernel_curve_active;
+    gint64 kernel_curve_error;
+    gint64 kernel_curve_temp;
+    gint kernel_curve_points[6];
 } Y720FanStatus;
 
 gboolean y720_fan_status_parse(JsonObject *data, Y720FanStatus *status, GError **error);

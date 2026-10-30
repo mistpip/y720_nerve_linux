@@ -1,108 +1,119 @@
 # Y720 Nerve Linux
 
-联想 Y720-15IKB 的 Linux 风扇、键盘功能键与四区背光控制。
+[中文 README](README.zh-CN.md)
 
-支持：**LENOVO 80Y4 / Y720-15IKB / BIOS 4GCN38WW / Linux x86_64**。程序会核验设备；
-其他型号、BIOS 或内核不保证兼容。
+Linux fan control, function-key support, and four-zone backlight tools for the Lenovo Y720-15IKB, version 0.1.1.
+Supported hardware is limited to LENOVO 80Y4 / Y720-15IKB / BIOS 4GCN38WW / x86_64.
 
-## 组件
+This project was completed with the assistance of AI.
 
-| 组件 | 说明 |
-|---|---|
-| `y720_cooling` | 风扇内核驱动，标准 hwmon 接口 |
-| `y720_hid` | 键盘功能键内核驱动 |
-| `y720-fan` / `y720-backlight` | CLI 控制程序 |
-| `y720-control` | GTK4 + libadwaita GUI 控制程序 |
+## Features and design
 
-## 安装
+- `y720_cooling`: keeps the factory auto/boost modes and provides linked control through standard hwmon; custom curves are executed by Linux thermal's `step_wise` governor.
+- `y720_hid`: adds missing function-key events.
+- `y720-fan` and `y720-backlight`: two independent CLI tools.
+- `y720-control`: a GTK4/libadwaita GUI that calls the CLI asynchronously and handles configuration, status, and shortcuts. It does not access hardware ports directly and is not a curve daemon.
 
-deb 包（推荐）：
+Both fans share one target from 1500 to 5100 RPM. They cannot be controlled independently or stopped.
+`pwm1` is a normalized request, not an electrical duty cycle. External hwmon tools such as fancontrol and CoolerControl can control the device independently; writing an hwmon target directly releases kernel curve control, so do not run another controller at the same time.
+
+The curve uses one kernel control temperature read directly from Linux thermal's `x86_pkg_temp`.
+It comes from the CPU package, not the highest temperature in the system, and is not guaranteed to represent a discrete GPU under a separate heavy load.
+No userspace sampling service is required. The project does not call NVIDIA tools or read discrete-GPU power state.
+The curve may request 5100 RPM at any time; overheating is not a prerequisite. If the control temperature is unavailable or communication fails, the driver keeps the last target, reports the error, and retries. It does not automatically switch to auto/boost or force a fixed full-speed fallback. Unload, shutdown, and suspend hand control back to firmware auto; after resume, the previous curve is restored. Recovery is not guaranteed if the hardware disappears or the kernel crashes.
+
+The backlight is controlled from userspace through an independent hidraw interface, with a fixed palette, five effects, and four-zone brightness.
+The hardware does not provide reliable color or brightness readback, so a submitted or saved profile does not represent confirmed hardware state.
+
+## Screenshots
+
+![Main window](screenshots/nerve1_en.png)
+
+![Settings window](screenshots/nerve2_en.png)
+
+## Installation and removal
+
+Build as a regular user first. The GUI requires GTK 4.16+ and libadwaita 1.7+; modules must be built with headers and toolchains matching the running kernel.
+
+```sh
+# Debian 13
+sudo apt install build-essential meson ninja-build pkg-config python3 dpkg-dev \
+  libgtk-4-dev libadwaita-1-dev libjson-glib-dev libgdk-pixbuf-2.0-dev \
+  libx11-dev dkms
+make
+make gui
+sudo ./install.sh
+```
+
+The source install prefix defaults to `/usr/local`; `--cli`, `--gui`, and `--drivers` can be selected.
+When using a custom prefix, use it for both the build and installation, for example `make gui PREFIX=/opt/y720` and `sudo ./install.sh --prefix /opt/y720`. Installation does not load modules, take over hardware, or enable startup control automatically; the HID alias may bind automatically when the device appears.
 
 ```sh
 ./scripts/build-debs.sh
-sudo apt install ./dist/*.deb
+sudo apt install ./dist/y720-control_*.deb ./dist/y720-cooling-dkms_*.deb ./dist/y720-hid-dkms_*.deb
 ```
 
-| 包 | 内容 |
-|---|---|
-| `y720-cooling-dkms` | 风扇 DKMS 驱动 |
-| `y720-hid-dkms` | 键盘功能键 DKMS 驱动 |
-| `y720-control` | CLI + GUI 程序 |
+Building on the target distribution is recommended.
 
-DKMS 安装需要 `dkms`、`make` 和匹配的内核 headers；安装器不会自动加载模块或改启动项。
+To remove a source installation, select auto first, then run `sudo ./uninstall.sh --all`, or remove individual components. The uninstaller preserves personal configuration and refuses to delete modified or unidentified files. Remove Debian packages with apt; do not use both methods to manage the same files. Before a source upgrade, use the old uninstaller to remove the old files.
 
-源码安装：
+## Usage
 
 ```sh
-sudo apt install build-essential libgtk-4-dev libadwaita-1-dev libjson-glib-dev \
-  libgdk-pixbuf-2.0-dev libx11-dev dkms
-make
-make gui
-sudo ./install.sh              # CLI + 驱动 + GUI
-sudo ./install.sh --cli        # 仅 CLI
-sudo ./install.sh --gui        # 仅 GUI
-sudo ./install.sh --drivers    # 仅驱动
-```
-
-## 驱动与按键映射
-
-```sh
-sudo modprobe y720_cooling                 # 只读测速
+sudo modprobe y720_cooling                 # read-only by default
+# If already loaded, unload it safely before enabling control; repeating modprobe does not change parameters
 sudo modprobe -r y720_cooling
-sudo modprobe y720_cooling allow_control=1 # 允许调速
-
-sudo modprobe y720_hid
-sudo scripts/keyboard-bind.sh bind
-scripts/keyboard-bind.sh status
-```
-
-键盘驱动保留普通键、音量、亮度和标准媒体键，额外映射：
-
-| 按键 | Linux 事件 |
-|---|---|
-| Fn+F4 | `KEY_MICMUTE` |
-| Fn+F6 | `KEY_TOUCHPAD_TOGGLE` |
-| Fn+F8 | `KEY_CAMERA_ACCESS_TOGGLE` |
-| Fn+空格 | `KEY_KBDILLUMTOGGLE`，仅上报，不直接控制背光 |
-| Fn+小键盘 7 | `KEY_PROG1` |
-| 不带修饰键的 F22 录屏键 | `KEY_RECORD`；`map_record=0` 可禁用 |
-| Fn+F7 的精确 `03 00` 报告 | `KEY_RFKILL`；仅 `radio_zero_pulse=1` 时启用 |
-
-Fn+F7 的实际飞行模式动作由系统 rfkill/桌面策略处理；启用方法、过滤窗口与回滚见
-[Fn+F7](docs/FNF7.md)。重新绑定键盘前请保留有线 SSH 或外接键盘恢复通道。
-
-## 可选 GameZone 兼容
-
-部分内核的 `lenovo_wmi_gamezone` 会在这台旧 BIOS 上探测不存在的 SmartFan 方法。
-`compat/gamezone/` 提供限定 LENOVO / 80Y4 / Y720-15IKB / BIOS 4GCN38WW 的窄修复，
-只跳过该探测，不整体禁用 WMI，也不替换厂商文件。
-
-`install.sh` 和 deb 包**不会**安装这个模块。需要时按 [GameZone 说明](docs/GAMEZONE.md)
-使用匹配的内核 headers 手动构建、审查并现场验证；不要跨内核安装预编译 `.ko`，
-也不要把参考模块加入 DKMS。
-
-## CLI
-
-```sh
+sudo modprobe y720_cooling allow_control=1
 y720-fan --json status
 sudo y720-fan mode auto
 sudo y720-fan mode boost
 sudo y720-fan set --rpm 4000
-
+printf '1500 1800 2400 3200 4200 5100\n' | sudo y720-fan curve apply -
+y720-control
 y720-backlight --json status
 sudo y720-backlight set --colors red blue green white --levels 0 1 2 3
-sudo y720-backlight off
 ```
 
-## 安全与限制
+Curves require `CONFIG_THERMAL_GOV_STEP_WISE` and a valid temperature source. An older module does not gain the new interface merely because its version number matches; see the [CLI manual](docs/CLI.md).
 
-驱动不提供任意 EC 访问；风扇只有一个联动通道。GUI 曲线由用户态采样温度并通过
-`y720-fan set --rpm` 提交，不是驱动内置曲线。背光不回读真实颜色/亮度，界面不会伪称
-已读回；写入失败或不确定时保留错误信息，不自动回滚。
+A complete GUI installation grants only the sudo/wheel administrator groups passwordless `sudo -n` access to fixed CLI commands. It does not allow arbitrary shells, file paths, or ordinary non-administrator users. The GUI always runs as the regular user.
+The dedicated backlight and input nodes use uaccess permissions from the active desktop session; key reading is not guaranteed over SSH, from an inactive session, or without logind. There is no need to add the user to the entire `input` group or open every hidraw device.
 
-源码安装默认 CLI 到 `/usr/local/bin`，deb 安装到 `/usr/bin`；polkit 策略按安装前缀生成。
+## Function keys
 
-## 许可
+| Key | Handling |
+|---|---|
+| Fn+F4 / F6 / F8 | Adds microphone mute, touchpad toggle, and camera-privacy events |
+| Fn+Space | `KEY_KBDILLUMTOGGLE`; backlight switching is handled in userspace |
+| Numpad 7 with NumLock off | `KEY_PROG1`; when the GUI is resident, shows the window without hiding it or switching profiles |
+| Numpad 8 / 9 / / with NumLock off | Standard HID play/pause, previous-track, and next-track mappings |
+| F22 record key without modifiers | `KEY_RECORD`; `map_record=0` disables it, while modified presses remain F22 |
+| Fn+F7 | Synthesizes a flight-mode event when `radio_zero_pulse=1`; disabled by default |
 
-内核驱动 GPL-2.0-only，CLI 与 GUI MIT。详见 [LICENSE](LICENSE) 与 [LICENSES/](LICENSES/)。
-GUI 图标素材来自 [stanislav7766/extreme-cooling](https://github.com/stanislav7766/extreme-cooling)。
+The numpad function layer does not require Fn; volume, brightness, and other standard keys use the kernel's generic path.
+Recognizing an event does not mean that the desktop has an action configured for it, and the camera function cannot be verified while the camera is physically disconnected.
+The default Ctrl+Shift+main-keyboard 0 shortcut switches auto/boost, and Fn+Space switches backlight profiles; existing custom settings are preserved.
+After the GUI exits completely, users may bind the launch key to `y720-control` themselves; the project does not rewrite desktop shortcuts or add a root service.
+
+Ordinary combinations use XGrabKey on X11 and the [GlobalShortcuts Portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html) on Wayland.
+Wayland requires `xdg-desktop-portal` and a desktop backend that implements this interface; the first activation may require approval in a desktop dialog.
+The settings page shows the authorization result and the combination actually assigned by the desktop; the saved combination is only a preferred request.
+Unauthorized or unsupported desktops report the reason instead of pretending to provide global support through XWayland; old `keycode:` settings must be recorded again.
+Fn+Space and the numpad launch key use the dedicated evdev node in both session types and keep the same permission requirements.
+
+Global shortcuts require the GUI to be running. If the desktop has no such Portal, bind either
+`gapplication action org.y720.Control fan-toggle` or
+`gapplication action org.y720.Control light-next` in the desktop's shortcut settings to control the running GUI.
+
+See the [development notes](docs/DEVELOPMENT.md) for enabling, limitations, and rollback of Fn+F7, as well as the optional narrow GameZone fix.
+
+## Verification and licensing
+
+`make test` covers pure functions, the simulated CLI, GUI lifecycle, and isolated installation without writing real hardware.
+Shortcut regression tests cover Portal authorization, cancellation, service loss, duplicate events, and exit cleanup; simulated tests do not replace actual key testing on each desktop.
+There is also an explicitly loaded Linux thermal integration-test module that does not connect to a real fan.
+Low, medium, and high setpoints and standard hwmon control have been verified. Unmodified fancontrol 3.6.2 and CoolerControl 5.0.1 have run real temperature curves without a dedicated plugin. The single-temperature design does not require NVIDIA libraries or a sampling service; the actual verification scope is the one documented for this version. Long-duration full-load, real suspend, and complete controlled heat-up/cool-down regressions remain incomplete.
+
+The kernel drivers and related C tests are GPL-2.0-only; the CLI, GUI, scripts, and documentation are MIT unless stated otherwise.
+Per-file SPDX identifiers, copyright notices, and the upstream GameZone attribution are retained; see [LICENSE](LICENSE).
+The repository does not distribute Lenovo Windows drivers, BIOS images, or proprietary firmware.

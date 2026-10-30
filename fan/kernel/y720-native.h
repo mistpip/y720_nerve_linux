@@ -59,10 +59,6 @@ static int y720_reg(unsigned int address, u8 *value)
 	case 0xc15: /* boost flag */
 	case 0x406: /* fan 1 tach, cross-check against command 46/81 */
 	case 0x4fe: /* fan 2 tach, cross-check against command 46/82 */
-	case 0x4b4: /* live GPU external sensor, despite AML's misleading CPUT name */
-	case 0xc0a: /* three-sample average of that sensor */
-	case 0x639: /* EC sensor error bits; bit 1 belongs to this sensor */
-	case 0x63b: /* consecutive GPU sensor communication failures */
 		return y720_transaction(0x7e, args, 2, value);
 	default:
 		return -EINVAL;
@@ -140,12 +136,10 @@ static int y720_native_mode(struct y720_data *data, int mode)
 	return 0;
 }
 
-static int y720_health(struct y720_data *data)
+static int y720_control_temperature(long *value)
 {
 	struct thermal_zone_device *zone;
-	u8 gpu_temp, average, errors, failures;
-	enum y720_temperature_state state;
-	int temp, active, ret;
+	int temp, ret;
 
 	/* Read a real kernel sensor, not the GameZone temperature stubs. */
 	zone = thermal_zone_get_zone_by_name("x86_pkg_temp");
@@ -154,59 +148,37 @@ static int y720_health(struct y720_data *data)
 	ret = thermal_zone_get_temp(zone, &temp);
 	if (ret)
 		return ret;
-	state = y720_cpu_health(temp);
-	if (state == Y720_TEMP_INVALID)
+	if (y720_cpu_health(temp) == Y720_TEMP_INVALID)
 		return -ENODATA;
-	if (state == Y720_TEMP_HOT) {
-		dev_err_ratelimited(&data->wdev->dev, "CPU temperature warning: %d mC; curve policy unchanged\n", temp);
-		return -EOVERFLOW;
-	}
-	/* The reference is held from probe to removal; never wake a sleeping GPU. */
-	if (!data->gpu)
-		return -ENODEV;
-	active = pm_runtime_get_if_active(&data->gpu->dev);
-	if (active < 0)
-		return active;
-	if (!active) {
-		/* Transitional/disabled runtime PM is not proof of a sleeping GPU. */
-		return pm_runtime_suspended(&data->gpu->dev) ? 0 : -EAGAIN;
-	}
-	/* Fixed BIOS EC SMBus sensor, available independently of the GPU driver.
-	 * Validated against nouveau on resume, and CPU-only heating as a cross-check.
-	 * 4GCN38WW AML calls 4b4 "CPUT", but it is zero when dGPU sleeps and
-	 * follows the dGPU external sensor when awake. Do not use WMI stubs 18/19.
-	 */
-	ret = y720_reg(0x4b4, &gpu_temp);
-	if (!ret)
-		ret = y720_reg(0xc0a, &average);
-	if (!ret)
-		ret = y720_reg(0x639, &errors);
-	if (!ret)
-		ret = y720_reg(0x63b, &failures);
-	/* Do not mark the GPU busy merely for reading the EC's independent sensor.
-	 * A plain pm_runtime_put invokes nouveau's idle path each second and can
-	 * postpone GPU autosuspend indefinitely. Preserve the original busy time.
-	 */
-	__pm_runtime_put_autosuspend(&data->gpu->dev);
+	*value = temp;
+	return 0;
+}
+
+static int y720_health(struct y720_data *data)
+{
+	long temperature;
+	int ret = y720_control_temperature(&temperature);
+
 	if (ret)
 		return ret;
-	state = y720_gpu_health(1, gpu_temp, average, errors, failures);
-	if (state == Y720_TEMP_INVALID) {
-		/* Resume may precede the EC sensor's first sample: report transient
-		 * telemetry, without changing the user-selected curve policy.
-		 */
-		if (!(errors & 2) && !failures && (!gpu_temp || !average))
-			return -EAGAIN;
-		dev_err_ratelimited(&data->wdev->dev,
-			"Active GPU temperature invalid: raw=%u average=%u errors=0x%02x failures=%u\n",
-			gpu_temp, average, errors, failures);
-		return -ENODATA;
-	}
-	if (state == Y720_TEMP_HOT) {
-		dev_err_ratelimited(&data->wdev->dev, "GPU temperature warning: raw=%u average=%u C; curve policy unchanged\n",
-			gpu_temp, average);
+	if (temperature >= Y720_CPU_LIMIT_MC) {
+		dev_err_ratelimited(&data->wdev->dev, "Control temperature warning: %ld mC; curve policy unchanged\n", temperature);
 		return -EOVERFLOW;
 	}
+	return 0;
+}
+
+/* A missing required sensor freezes the last target, never changes ownership
+ * or silently substitutes a factory mode. Called only under data->lock. */
+static int y720_curve_sample(struct y720_data *data, unsigned int *target)
+{
+	long temperature;
+	int ret = y720_control_temperature(&temperature);
+	data->curve_error = ret;
+	if (ret)
+		return ret;
+	data->curve_temperature = temperature;
+	*target = y720_curve_rpm(data->curve_points, temperature);
 	return 0;
 }
 
@@ -329,7 +301,7 @@ static void y720_guard_work(struct work_struct *work)
 	if (!ret && data->requested_mode == 1) {
 		/* Also recover a failed initial target write, without a policy fallback. */
 		ret = y720_target_write(data, data->target);
-		if (!ret)
+		if (!ret && !health)
 			health = y720_health(data);
 	} else if (!ret && mode != data->mode) {
 		ret = -EIO;
@@ -374,7 +346,9 @@ static int y720_native_hwmon_read(struct y720_data *data, enum hwmon_sensor_type
 		ret = -EBUSY;
 		goto out;
 	}
-	if (type == hwmon_fan && attr == hwmon_fan_input && channel < 2) {
+	if (type == hwmon_temp && attr == hwmon_temp_input && channel == 0) {
+		ret = y720_control_temperature(val);
+	} else if (type == hwmon_fan && attr == hwmon_fan_input && channel < 2) {
 		ret = y720_tach(channel, val);
 		if (ret && data->needs_restore)
 			y720_fault(data, ret);
@@ -387,7 +361,7 @@ static int y720_native_hwmon_read(struct y720_data *data, enum hwmon_sensor_type
 
 		ret = y720_mode_read(&actual);
 		if (!ret)
-			*val = actual;
+			*val = actual == 1 && data->kernel_curve && data->thermal_enabled ? 3 : actual;
 		else if (data->needs_restore)
 			y720_fault(data, ret);
 	} else {
@@ -403,6 +377,7 @@ static int y720_native_hwmon_write(struct device *dev, enum hwmon_sensor_types t
 {
 	struct y720_data *data = dev_get_drvdata(dev);
 	unsigned int rpm, pwm;
+	bool sync = false;
 	int ret = 0;
 
 	if (!data->native || !allow_control)
@@ -415,13 +390,15 @@ static int y720_native_hwmon_write(struct device *dev, enum hwmon_sensor_types t
 		goto out;
 	}
 	if (type == hwmon_pwm && attr == hwmon_pwm_enable) {
-		if (val > 2) {
+		if (val > 3) {
 			ret = -EINVAL;
 			goto out;
 		}
 		if (val == 2 || val == 0) {
 			ret = y720_native_mode(data, val);
 			if (!ret) {
+				data->kernel_curve = false;
+				sync = true;
 				/* Explicit user selection, unlike an automatic fault fallback. */
 				data->requested_mode = val;
 				data->curve_entry_pending = false;
@@ -436,7 +413,20 @@ static int y720_native_hwmon_write(struct device *dev, enum hwmon_sensor_types t
 			goto handled;
 		}
 		rpm = data->target;
-		pwm = data->pwm;
+		if (val == 3) {
+			if (!data->thermal_zone) {
+				ret = -EOPNOTSUPP;
+				goto out;
+			}
+			ret = y720_curve_sample(data, &rpm);
+			if (ret)
+				goto out;
+		}
+		data->kernel_curve = val == 3;
+		sync = true;
+		if (val == 3)
+			data->thermal_state = y720_thermal_state(data->curve_temperature);
+		pwm = val == 3 ? y720_rpm_to_pwm(rpm) : data->pwm;
 		data->requested_mode = 1;
 		data->curve_entry_pending = true;
 	} else if (type == hwmon_pwm && attr == hwmon_pwm_input) {
@@ -446,6 +436,8 @@ static int y720_native_hwmon_write(struct device *dev, enum hwmon_sensor_types t
 		}
 		pwm = val;
 		rpm = y720_pwm_to_rpm(pwm);
+		data->kernel_curve = false;
+		sync = true;
 	} else if (type == hwmon_fan && attr == hwmon_fan_target) {
 		if (val < Y720_MIN_RPM || val > Y720_MAX_RPM) {
 			ret = -EINVAL;
@@ -453,6 +445,8 @@ static int y720_native_hwmon_write(struct device *dev, enum hwmon_sensor_types t
 		}
 		rpm = y720_round_rpm(val);
 		pwm = y720_rpm_to_pwm(rpm);
+		data->kernel_curve = false;
+		sync = true;
 	} else {
 		ret = -EOPNOTSUPP;
 		goto out;
@@ -472,12 +466,12 @@ handled:
 		queue_delayed_work(system_wq, &data->guard_work, HZ);
 out:
 	mutex_unlock(&data->lock);
+	if (sync) {
+		int sync_ret = y720_thermal_sync(data);
+		if (!ret)
+			ret = sync_ret;
+	}
 	return ret;
-}
-
-static void y720_gpu_put(void *arg)
-{
-	pci_dev_put(arg);
 }
 
 static int y720_native_init(struct y720_data *data)
@@ -494,15 +488,6 @@ static int y720_native_init(struct y720_data *data)
 	if (!devm_request_region(&data->wdev->dev, Y720_DATA_PORT, 1, "y720_cooling") ||
 	    !devm_request_region(&data->wdev->dev, Y720_STATUS_PORT, 1, "y720_cooling"))
 		return -EBUSY;
-	/* Exact internal GPU location; do not latch onto an unrelated eGPU. */
-	data->gpu = pci_get_domain_bus_and_slot(0, 1, PCI_DEVFN(0, 0));
-	if (!data->gpu || data->gpu->vendor != PCI_VENDOR_ID_NVIDIA) {
-		pci_dev_put(data->gpu);
-		return -ENODEV;
-	}
-	ret = devm_add_action_or_reset(&data->wdev->dev, y720_gpu_put, data->gpu);
-	if (ret)
-		return ret;
 	ret = y720_mode_read(&data->mode);
 	if (!ret)
 		ret = y720_tach(0, &rpm);

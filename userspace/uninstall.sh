@@ -15,14 +15,14 @@ check() {
 }
 check "$root/userspace/build/y720-fan" "$prefix/bin/y720-fan"
 check "$root/userspace/build/y720-backlight" "$prefix/bin/y720-backlight"
-for name in USERSPACE-DRIVER-API.md CLI.md GUI-INTEGRATION.md C-DEVELOPMENT.md FNF7.md COMPATIBILITY.md; do
+for name in CLI.md DEVELOPMENT.md; do
     check "$root/docs/$name" "$prefix/share/doc/y720-cli/$name"
 done
 test "${2:-}" != --check || exit 0
 for name in y720-fan y720-backlight; do
     if test -f "$prefix/bin/$name"; then rm -- "$prefix/bin/$name"; fi
 done
-for name in USERSPACE-DRIVER-API.md CLI.md GUI-INTEGRATION.md C-DEVELOPMENT.md FNF7.md COMPATIBILITY.md; do
+for name in CLI.md DEVELOPMENT.md; do
     if test -f "$prefix/share/doc/y720-cli/$name"; then rm -- "$prefix/share/doc/y720-cli/$name"; fi
 done
 echo 'Removed only matching CLI/manual files; retained directories, drivers and device settings.'

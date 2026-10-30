@@ -13,10 +13,9 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pm.h>
-#include <linux/pci.h>
-#include <linux/pm_runtime.h>
 #include <linux/reboot.h>
 #include <linux/slab.h>
+#include <linux/ctype.h>
 #include <linux/sysfs.h>
 #include <linux/thermal.h>
 #include <linux/wmi.h>
@@ -35,16 +34,27 @@ MODULE_PARM_DESC(allow_control, "Enable fixed-protocol hwmon control on verified
 
 struct y720_data {
 	struct wmi_device *wdev;
+	struct device *dev;
 	struct mutex lock;
 	struct delayed_work restore_work;
 	struct delayed_work guard_work;
-	struct pci_dev *gpu;
+	/* Lock order: thermal_lock -> thermal core -> lock. Never enter the
+	 * thermal core while holding lock: callbacks acquire it themselves. */
+	struct mutex thermal_lock;
+	struct thermal_zone_device *thermal_zone;
+	struct thermal_cooling_device *cooling;
+	bool thermal_enabled;
+	unsigned long thermal_state;
 	bool native;
 	bool faulted;
 	int last_error;
 	bool suspend_curve;
 	bool suspend_entry_pending;
 	bool curve_entry_pending;
+	bool kernel_curve;
+	unsigned int curve_points[Y720_CURVE_POINTS];
+	long curve_temperature;
+	int curve_error;
 	int requested_mode;
 	int mode;
 	unsigned int target;
@@ -66,6 +76,7 @@ struct y720_data {
 };
 
 static int y720_native_mode(struct y720_data *data, int mode);
+static int y720_thermal_sync(struct y720_data *data);
 
 static const struct dmi_system_id y720_dmi[] = {
 	{
@@ -157,6 +168,7 @@ static int y720_restore_locked(struct y720_data *data)
 }
 
 #include "y720-native.h"
+#include "y720-thermal.h"
 
 static void y720_restore_work(struct work_struct *work)
 {
@@ -266,6 +278,138 @@ static ssize_t requested_mode_show(struct device *dev, struct device_attribute *
 }
 static DEVICE_ATTR_RO(requested_mode);
 
+static ssize_t temperature_source_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct y720_data *data = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%s\n", data->native ? "x86_pkg_temp" : "unavailable");
+}
+static DEVICE_ATTR_RO(temperature_source);
+
+static ssize_t control_api_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct y720_data *data = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%u\n", data->thermal_zone ? 2 : 1);
+}
+static DEVICE_ATTR_RO(control_api);
+
+static ssize_t curve_backend_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct y720_data *data = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%s\n", data->thermal_zone ? "linux-thermal" : "unavailable");
+}
+static DEVICE_ATTR_RO(curve_backend);
+
+static ssize_t curve_active_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct y720_data *data = dev_get_drvdata(dev);
+	bool active;
+	mutex_lock(&data->lock);
+	active = data->kernel_curve && data->thermal_enabled && data->requested_mode == 1 && !data->blocked;
+	mutex_unlock(&data->lock);
+	return sysfs_emit(buf, "%u\n", active);
+}
+static DEVICE_ATTR_RO(curve_active);
+
+static ssize_t curve_error_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct y720_data *data = dev_get_drvdata(dev);
+	int error;
+	mutex_lock(&data->lock);
+	error = data->curve_error;
+	mutex_unlock(&data->lock);
+	return sysfs_emit(buf, "%d\n", error);
+}
+static DEVICE_ATTR_RO(curve_error);
+
+static ssize_t curve_temperature_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct y720_data *data = dev_get_drvdata(dev);
+	ssize_t ret;
+	mutex_lock(&data->lock);
+	ret = data->kernel_curve && !data->curve_error && data->curve_temperature ?
+		sysfs_emit(buf, "%ld\n", data->curve_temperature) : -ENODATA;
+	mutex_unlock(&data->lock);
+	return ret;
+}
+static DEVICE_ATTR_RO(curve_temperature);
+
+static ssize_t curve_profile_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct y720_data *data = dev_get_drvdata(dev);
+	ssize_t ret;
+	mutex_lock(&data->lock);
+	ret = sysfs_emit(buf, "%u %u %u %u %u %u\n", data->curve_points[0], data->curve_points[1],
+		data->curve_points[2], data->curve_points[3], data->curve_points[4], data->curve_points[5]);
+	mutex_unlock(&data->lock);
+	return ret;
+}
+
+/* One bounded sysfs transaction validates and installs the complete curve.
+ * No gap between uploading the points and changing the control owner. */
+static ssize_t curve_profile_store(struct device *dev, struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct y720_data *data = dev_get_drvdata(dev);
+	unsigned int points[Y720_CURVE_POINTS], previous[Y720_CURVE_POINTS], rpm;
+	char *copy, *cursor, *token;
+	unsigned int n = 0;
+	bool sync = false;
+	int ret = 0;
+	if (!data->native || !allow_control || !data->thermal_zone)
+		return -EOPNOTSUPP;
+	if (!count || count >= 128 || memchr(buf, '\0', count))
+		return -EINVAL;
+	copy = kmemdup_nul(buf, count, GFP_KERNEL);
+	if (!copy)
+		return -ENOMEM;
+	cursor = copy;
+	while ((token = strsep(&cursor, " \t\r\n"))) {
+		if (!*token)
+			continue;
+		if (n == Y720_CURVE_POINTS || kstrtouint(token, 10, &points[n++])) {
+			ret = -EINVAL;
+			break;
+		}
+	}
+	kfree(copy);
+	if (ret || n != Y720_CURVE_POINTS || !y720_curve_valid(points))
+		return -EINVAL;
+	mutex_lock(&data->lock);
+	if (data->blocked) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	memcpy(previous, data->curve_points, sizeof(previous));
+	memcpy(data->curve_points, points, sizeof(points));
+	ret = y720_curve_sample(data, &rpm);
+	if (ret) {
+		memcpy(data->curve_points, previous, sizeof(previous));
+		goto unlock;
+	}
+	data->curve_entry_pending = data->requested_mode != 1;
+	data->kernel_curve = true;
+	sync = true;
+	data->thermal_state = y720_thermal_state(data->curve_temperature);
+	data->requested_mode = 1;
+	if (rpm != data->target)
+		data->desired_since = jiffies;
+	data->target = rpm;
+	data->pwm = y720_rpm_to_pwm(rpm);
+	ret = y720_target_write(data, rpm);
+	if (ret)
+		y720_fault(data, ret);
+	mod_delayed_work(system_wq, &data->guard_work, HZ);
+unlock:
+	mutex_unlock(&data->lock);
+	if (sync) {
+		int sync_ret = y720_thermal_sync(data);
+		if (!ret)
+			ret = sync_ret;
+	}
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(curve_profile);
+
 static ssize_t y720_query_show(struct device *dev, u32 method, char *buf)
 {
 	struct y720_data *data = dev_get_drvdata(dev);
@@ -319,6 +463,9 @@ static umode_t y720_hwmon_visible(const void *unused,
 {
 	const struct y720_data *data = unused;
 
+	if (data->native && type == hwmon_temp && channel == 0 &&
+	    (attr == hwmon_temp_input || attr == hwmon_temp_label))
+		return 0444;
 	if (data->native && channel == 0 &&
 	    ((type == hwmon_pwm && (attr == hwmon_pwm_input || attr == hwmon_pwm_enable)) ||
 	     (type == hwmon_fan && attr == hwmon_fan_target)))
@@ -355,6 +502,10 @@ static int y720_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 static int y720_hwmon_read_string(struct device *dev, enum hwmon_sensor_types type,
 				  u32 attr, int channel, const char **str)
 {
+	if (type == hwmon_temp && attr == hwmon_temp_label && channel == 0) {
+		*str = "Control temperature (CPU package)";
+		return 0;
+	}
 	if (type != hwmon_fan || attr != hwmon_fan_label || channel < 0 || channel > 1)
 		return -EOPNOTSUPP;
 	/* Physical CPU/GPU association has not been established. */
@@ -373,6 +524,7 @@ static const struct hwmon_channel_info * const y720_hwmon_info[] = {
 	HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT | HWMON_F_LABEL | HWMON_F_TARGET,
 			   HWMON_F_INPUT | HWMON_F_LABEL),
 	HWMON_CHANNEL_INFO(pwm, HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
+	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT | HWMON_T_LABEL),
 	NULL
 };
 
@@ -455,6 +607,13 @@ static struct attribute *y720_attrs[] = {
 	&dev_attr_last_error.attr,
 	&dev_attr_safety_fault.attr,
 	&dev_attr_requested_mode.attr,
+	&dev_attr_temperature_source.attr,
+	&dev_attr_control_api.attr,
+	&dev_attr_curve_backend.attr,
+	&dev_attr_curve_profile.attr,
+	&dev_attr_curve_active.attr,
+	&dev_attr_curve_error.attr,
+	&dev_attr_curve_temperature.attr,
 	&dev_attr_last_command.attr,
 	&dev_attr_fan_cooling_supported.attr,
 	&dev_attr_firmware_status_raw.attr,
@@ -483,10 +642,13 @@ static int y720_quiesce(struct device *dev, bool save_policy)
 		data->suspend_entry_pending = data->curve_entry_pending;
 	}
 	data->blocked = true;
+	if (!save_policy)
+		data->kernel_curve = false;
 	data->requested_mode = 2;
 	data->curve_entry_pending = false;
 	ret = y720_restore_locked(data);
 	mutex_unlock(&data->lock);
+	y720_thermal_sync(data);
 	cancel_delayed_work_sync(&data->restore_work);
 	cancel_delayed_work_sync(&data->guard_work);
 	return ret;
@@ -523,6 +685,7 @@ static int y720_suspend(struct device *dev)
 			mod_delayed_work(system_wq, &data->restore_work, HZ);
 		}
 		mutex_unlock(&data->lock);
+		y720_thermal_sync(data);
 	}
 	return ret;
 }
@@ -541,6 +704,7 @@ static int y720_resume(struct device *dev)
 		data->suspend_curve = false;
 	}
 	mutex_unlock(&data->lock);
+	y720_thermal_sync(data);
 	return 0; /* Restore the requested curve, never firmware boost. */
 }
 static DEFINE_SIMPLE_DEV_PM_OPS(y720_pm, y720_suspend, y720_resume);
@@ -569,8 +733,14 @@ static int y720_probe(struct wmi_device *wdev, const void *context)
 	if (!data)
 		return -ENOMEM;
 	data->wdev = wdev;
+	data->dev = &wdev->dev;
 	data->last_command = -1;
+	{
+		const unsigned int defaults[Y720_CURVE_POINTS] = {1500, 1800, 2400, 3200, 4200, 5100};
+		memcpy(data->curve_points, defaults, sizeof(defaults));
+	}
 	mutex_init(&data->lock);
+	mutex_init(&data->thermal_lock);
 	INIT_DELAYED_WORK(&data->restore_work, y720_restore_work);
 	INIT_DELAYED_WORK(&data->guard_work, y720_guard_work);
 	data->reboot_nb.notifier_call = y720_reboot;
@@ -586,6 +756,11 @@ static int y720_probe(struct wmi_device *wdev, const void *context)
 	ret = devm_register_reboot_notifier(&wdev->dev, &data->reboot_nb);
 	if (ret)
 		return ret;
+	if (data->native) {
+		ret = y720_thermal_init(data);
+		if (ret)
+			return ret;
+	}
 	/* Publish the verified RPM ABI only for the BIOS inspected and tested. */
 	if (dmi_match(DMI_BIOS_VERSION, "4GCN38WW")) {
 		hwmon = devm_hwmon_device_register_with_info(&wdev->dev, "y720_cooling",
@@ -622,4 +797,4 @@ static struct wmi_driver y720_driver = {
 module_wmi_driver(y720_driver);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Experimental Y720 legacy GameZone cooling, read-only by default");
-MODULE_VERSION("0.1");
+MODULE_VERSION(Y720_VERSION);

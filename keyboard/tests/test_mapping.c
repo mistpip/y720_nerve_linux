@@ -19,6 +19,16 @@ int main(void)
 	assert(y720_lookup_key(0xc0057, false) == KEY_CAMERA_ACCESS_TOGGLE);
 	assert(y720_lookup_key(0xc0050, false) == KEY_KBDILLUMTOGGLE);
 	assert(y720_lookup_key(0xc0053, false) == KEY_PROG1);
+	/* Both NumLock layers: only the vendor launcher needs our mapping.
+	 * Digits and standard media usages must remain with hid-input.
+	 */
+	for (usage = 0x59; usage <= 0x63; usage++)
+		assert(!y720_lookup_key(0x70000 | usage, true));
+	assert(!y720_lookup_key(0x70053, true)); /* NumLock */
+	assert(!y720_lookup_key(0x70054, true)); /* keypad / */
+	assert(!y720_lookup_key(0xc00cd, true)); /* play/pause */
+	assert(!y720_lookup_key(0xc00b6, true)); /* previous */
+	assert(!y720_lookup_key(0xc00b5, true)); /* next */
 	assert(y720_lookup_key(0x70072, false) == KEY_TOUCHPAD_TOGGLE);
 	assert(y720_lookup_key(0x70071, false) == 0);
 	assert(y720_lookup_key(0x70071, true) == KEY_RECORD);

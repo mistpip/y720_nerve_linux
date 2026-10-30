@@ -1,10 +1,32 @@
 /* SPDX-License-Identifier: MIT */
 #include "y720-settings.h"
+#include "y720-i18n.h"
 
 #include <errno.h>
 #include <stdio.h>
+#include <gtk/gtk.h>
 #include <string.h>
 #include <unistd.h>
+
+static gboolean valid_accel(const gchar *accel)
+{
+    if (!accel || !*accel)
+        return FALSE;
+    if (g_str_has_prefix(accel, "keycode:")) {
+        gchar *end;
+        guint64 code = g_ascii_strtoull(accel + 8, &end, 10);
+        return *end == '\0' && code > 0 && code <= 255;
+    }
+    if (g_str_has_prefix(accel, "evdev:")) {
+        gchar *end;
+        guint64 code = g_ascii_strtoull(accel + 6, &end, 10);
+        return *end == '\0' && code > 0 && code <= 0x2ff;
+    }
+    guint keyval = 0;
+    GdkModifierType mods = 0;
+    gtk_accelerator_parse(accel, &keyval, &mods);
+    return keyval != 0;
+}
 
 static gchar *config_dir(void)
 {
@@ -29,8 +51,36 @@ static gboolean ensure_dir(const gchar *path, GError **error)
     if (g_mkdir_with_parents(path, 0700) == 0)
         return TRUE;
     g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(errno),
-                "无法创建目录 %s：%s", path, g_strerror(errno));
+                y720_tr("无法创建目录 %s：%s"), path, g_strerror(errno));
     return FALSE;
+}
+
+static void normalize_shifted_digit(gchar **accel)
+{
+    if (!accel || !*accel || !strstr(*accel, "<Shift>"))
+        return;
+    static const struct { const gchar *name; const gchar *digit; } map[] = {
+        {"parenright", "0"}, {"exclam", "1"}, {"at", "2"},
+        {"numbersign", "3"}, {"dollar", "4"}, {"percent", "5"},
+        {"asciicircum", "6"}, {"ampersand", "7"}, {"asterisk", "8"},
+        {"parenleft", "9"},
+    };
+    for (guint i = 0; i < G_N_ELEMENTS(map); i++) {
+        if (g_str_has_suffix(*accel, map[i].name)) {
+            gchar *base = g_strndup(*accel, strlen(*accel) - strlen(map[i].name));
+            gchar *fixed = g_strconcat(base, map[i].digit, NULL);
+            g_free(base);
+            g_free(*accel);
+            *accel = fixed;
+            return;
+        }
+    }
+}
+
+void y720_settings_normalize_shortcuts(Y720Settings *settings)
+{
+    normalize_shifted_digit(&settings->profile_hotkey);
+    normalize_shifted_digit(&settings->boost_hotkey);
 }
 
 Y720Settings *y720_settings_new(void)
@@ -38,12 +88,13 @@ Y720Settings *y720_settings_new(void)
     Y720Settings *settings = g_new0(Y720Settings, 1);
     settings->close_to_tray = TRUE;
     settings->global_hotkey = TRUE;
+    settings->language = g_strdup("auto");
     settings->background_opacity = 0.45;
     settings->panel_opacity = 0.86;
     settings->window_opacity = 1.0;
     settings->accent = g_strdup("#c01c28");
-    settings->profile_hotkey = g_strdup("<Control><Alt>p");
-    settings->boost_hotkey = g_strdup("<Control>b");
+    settings->profile_hotkey = g_strdup(Y720_DEFAULT_PROFILE_HOTKEY);
+    settings->boost_hotkey = g_strdup(Y720_DEFAULT_BOOST_HOTKEY);
     const gint curve_defaults[6] = {1500, 1800, 2400, 3200, 4200, 5100};
     memcpy(settings->curve_points, curve_defaults, sizeof(curve_defaults));
 
@@ -71,6 +122,13 @@ Y720Settings *y720_settings_new(void)
                 settings->curve_points[i] = CLAMP(curve[i], 1500, 5100);
         }
         g_free(curve);
+        gchar *language = g_key_file_get_string(keyfile, "general", "language", NULL);
+        if (language && *language) {
+            g_free(settings->language);
+            settings->language = language;
+        } else {
+            g_free(language);
+        }
         gchar *boost_hotkey = g_key_file_get_string(keyfile, "shortcuts", "boost", NULL);
         if (boost_hotkey && *boost_hotkey) {
             g_free(settings->boost_hotkey);
@@ -81,7 +139,6 @@ Y720Settings *y720_settings_new(void)
         gchar *hotkey = g_key_file_get_string(keyfile, "shortcuts", "profile", NULL);
         if (hotkey && *hotkey) {
             g_free(settings->profile_hotkey);
-    g_free(settings->boost_hotkey);
             settings->profile_hotkey = hotkey;
         } else {
             g_free(hotkey);
@@ -97,6 +154,15 @@ Y720Settings *y720_settings_new(void)
         settings->panel_opacity = CLAMP(settings->panel_opacity, 0.35, 1.0);
         settings->window_opacity = CLAMP(settings->window_opacity, 0.5, 1.0);
 
+        y720_settings_normalize_shortcuts(settings);
+        if (!valid_accel(settings->profile_hotkey)) {
+            g_free(settings->profile_hotkey);
+            settings->profile_hotkey = g_strdup(Y720_DEFAULT_PROFILE_HOTKEY);
+        }
+        if (!valid_accel(settings->boost_hotkey)) {
+            g_free(settings->boost_hotkey);
+            settings->boost_hotkey = g_strdup(Y720_DEFAULT_BOOST_HOTKEY);
+        }
         gchar *effect = g_key_file_get_string(keyfile, "backlight", "effect", NULL);
         gsize count = 0;
         gint *colors = g_key_file_get_integer_list(keyfile, "backlight", "colors", &count, NULL);
@@ -135,6 +201,7 @@ void y720_settings_free(Y720Settings *settings)
     g_free(settings->accent);
     g_free(settings->profile_hotkey);
     g_free(settings->boost_hotkey);
+    g_free(settings->language);
     g_free(settings);
 }
 
@@ -150,6 +217,8 @@ void y720_settings_save(const Y720Settings *settings)
     g_key_file_set_boolean(keyfile, "general", "start_hidden", settings->start_hidden);
     g_key_file_set_boolean(keyfile, "general", "close_to_tray", settings->close_to_tray);
     g_key_file_set_boolean(keyfile, "general", "global_hotkey", settings->global_hotkey);
+    g_key_file_set_string(keyfile, "general", "language",
+                          settings->language ? settings->language : "auto");
     g_key_file_set_string(keyfile, "appearance", "background",
                           settings->background_path ? settings->background_path : "");
     g_key_file_set_double(keyfile, "appearance", "background_opacity", settings->background_opacity);
@@ -158,11 +227,11 @@ void y720_settings_save(const Y720Settings *settings)
     g_key_file_set_string(keyfile, "appearance", "accent",
                           settings->accent ? settings->accent : "#c01c28");
     g_key_file_set_string(keyfile, "shortcuts", "profile",
-                          settings->profile_hotkey ? settings->profile_hotkey : "<Control><Alt>p");
+                          settings->profile_hotkey ? settings->profile_hotkey : Y720_DEFAULT_PROFILE_HOTKEY);
     g_key_file_set_string(keyfile, "shortcuts", "boost",
-                          settings->boost_hotkey ? settings->boost_hotkey : "<Control>b");
+                          settings->boost_hotkey ? settings->boost_hotkey : Y720_DEFAULT_BOOST_HOTKEY);
     g_key_file_set_boolean(keyfile, "fan", "curve_enabled", settings->curve_enabled);
-    g_key_file_set_integer_list(keyfile, "fan", "curve_points", settings->curve_points, 6);
+    g_key_file_set_integer_list(keyfile, "fan", "curve_points", (gint *)settings->curve_points, 6);
 
     if (settings->has_profile) {
         g_key_file_set_string(keyfile, "backlight", "effect",
@@ -229,11 +298,11 @@ gboolean y720_autostart_set(gboolean enabled, GError **error)
             ok = TRUE;
         } else if (!strstr(contents, "X-Y720-Control-Autostart=true")) {
             g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_EXIST,
-                        "自启动文件已存在且不是本程序创建的，未删除：%s", path);
+                        y720_tr("自启动文件已存在且不是本程序创建的，未删除：%s"), path);
             ok = FALSE;
         } else if (unlink(path) != 0) {
             g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(errno),
-                        "无法删除自启动文件：%s", g_strerror(errno));
+                        y720_tr("无法删除自启动文件：%s"), g_strerror(errno));
             ok = FALSE;
         }
         g_free(contents);
@@ -245,7 +314,7 @@ gboolean y720_autostart_set(gboolean enabled, GError **error)
     if (g_file_get_contents(path, &existing, NULL, NULL)) {
         if (!strstr(existing, "X-Y720-Control-Autostart=true")) {
             g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_EXIST,
-                        "自启动文件已存在且不是本程序创建的，未覆盖：%s", path);
+                        y720_tr("自启动文件已存在且不是本程序创建的，未覆盖：%s"), path);
             g_free(existing);
             g_free(path);
             return FALSE;
@@ -264,7 +333,7 @@ gboolean y720_autostart_set(gboolean enabled, GError **error)
     gchar exe[4096];
     gssize length = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
     if (length <= 0) {
-        g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED, "无法确定程序路径");
+        g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED, y720_tr("无法确定程序路径"));
         g_free(path);
         return FALSE;
     }

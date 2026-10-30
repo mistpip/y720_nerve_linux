@@ -44,7 +44,7 @@ class CCLI(unittest.TestCase):
             self.assertFalse(obj['ok'])
         self.assertEqual(obj['schema_version'], 1)
         self.assertEqual(obj['program'], f'y720-{program}')
-        self.assertEqual(obj['version'], '0.1')
+        self.assertEqual(obj['version'], (ROOT / 'VERSION').read_text().strip())
         return obj['data' if expected == 0 else 'error']
 
     def test_every_pwm_and_rpm(self):
@@ -182,7 +182,7 @@ class CCLI(unittest.TestCase):
             subprocess.run(install,check=True,capture_output=True)
             for name in ['y720-fan','y720-backlight']:
                 self.assertTrue((binaries/name).read_bytes().startswith(b'\x7fELF'))
-            document = prefix/'share/doc/y720-cli/C-DEVELOPMENT.md'
+            document = prefix/'share/doc/y720-cli/DEVELOPMENT.md'
             original = document.read_bytes()
             document.unlink()
             document.symlink_to(foreign)
@@ -206,7 +206,7 @@ class CCLI(unittest.TestCase):
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertEqual(result.stderr,b'')
             obj = json.loads(result.stdout)
-            self.assertEqual(obj['version'],'0.1')
+            self.assertEqual(obj['version'],(ROOT/'VERSION').read_text().strip())
             self.assertTrue(obj['ok'])
             states.append(obj['data'])
         self.assertEqual(states[0],states[1])
@@ -225,22 +225,39 @@ class CCLI(unittest.TestCase):
 
     def test_fan_status_snapshots(self):
         fixture = ROOT/'userspace/build/test-c-fan'
-        for mode in ['curve','readonly']:
+        for mode in ['curve','readonly','thermal']:
             result = subprocess.run([str(fixture),mode],capture_output=True)
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertEqual(result.stderr,b'')
             obj = json.loads(result.stdout)
-            self.assertEqual(obj['version'],'0.1')
+            self.assertEqual(obj['version'],(ROOT/'VERSION').read_text().strip())
             self.assertEqual(obj['program'],'y720-fan')
             data = obj['data']
             self.assertEqual(data['fan_rpm'],[1500,1500])
-            self.assertEqual(data['driver_version'],'0.1')
-            self.assertEqual(data['controls_available'],mode == 'curve')
+            self.assertEqual(data['driver_version'],(ROOT/'VERSION').read_text().strip())
+            self.assertEqual(data['controls_available'],mode != 'readonly')
             if mode == 'readonly':
                 for field in ['mode','mode_raw','target_rpm','pwm']: self.assertIsNone(data[field])
             else:
                 self.assertEqual(data['mode'],'curve')
                 self.assertEqual(data['target_rpm'],1500)
+            self.assertEqual(data['kernel_curve']['supported'],mode == 'thermal')
+            self.assertEqual(data['kernel_curve']['active'],mode == 'thermal')
+            if mode == 'thermal':
+                self.assertEqual(data['mode_raw'],3)
+                self.assertEqual(data['kernel_curve']['engine'],'linux-thermal')
+
+    def test_kernel_curve_input(self):
+        good = b'1500 1800 2400 3200 4200 5100\n'
+        self.invoke('fan',['curve','apply','-'],good)
+        self.invoke('fan',['curve','apply','-'],b'5100 '*6)
+        self.invoke('fan',['curve','stop'])
+        for data in [b'', b'1500 '*5, b'1500 '*7, good+b'\0', b'1499 '+b'1500 '*5,
+                     b'1500 1500 1400 3000 4000 5100', b'1500 3000 2000 3000 4000 5100',
+                     b'1500 1800 2400 3200 4200 5101', good+b'x', b' '*128,
+                     b'1500.0 1800 2400 3200 4200 5100', b'9223372036854775808 '+b'1500 '*5]:
+            with self.subTest(data=data):
+                self.invoke('fan',['curve','apply','-'],data,expected=2)
 
 
 if __name__ == '__main__': unittest.main()

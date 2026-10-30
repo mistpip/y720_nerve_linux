@@ -1,6 +1,8 @@
 [Desktop Entry]
 Name=Y720 Nerve Center
-GenericName=极致散热与幻彩地带
+GenericName=Fan and keyboard backlight control
+GenericName[zh_CN]=极致散热与幻彩地带
+Comment[zh_CN]=Y720 风扇与键盘背光控制
 Comment=Y720 fan and keyboard backlight control
 Exec=y720-control
 Icon=org.y720.Control

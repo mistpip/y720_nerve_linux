@@ -3,9 +3,16 @@
 #include <string.h>
 
 #include "y720-app.h"
+#include "y720-settings.h"
+#include "y720-i18n.h"
 
 int main(int argc, char **argv)
 {
+    /* GTK's own buttons/dialogs choose translations during initialization.
+     * Load preferences without touching hardware, before creating the app. */
+    Y720Settings *preferences = y720_settings_new();
+    y720_i18n_prepare_environment(preferences->language);
+    y720_settings_free(preferences);
     gboolean hidden = FALSE;
     const gchar *screenshot = NULL;
     const gchar *page = NULL;
@@ -30,6 +37,7 @@ int main(int argc, char **argv)
 
     Y720App *app = y720_app_new(hidden, screenshot, page);
     int status = g_application_run(G_APPLICATION(app), clean_count, clean);
+    g_object_unref(app);
     g_free(clean);
     return status;
 }

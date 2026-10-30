@@ -21,7 +21,10 @@
 #include <time.h>
 #include <unistd.h>
 
-#define CLI_VERSION "0.1"
+#ifndef Y720_VERSION
+#error "Build with userspace/Makefile to supply the release VERSION"
+#endif
+#define CLI_VERSION Y720_VERSION
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 struct cli_error {
     const char *code;

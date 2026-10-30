@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include <stdio.h>
 #include "y720-profiles.h"
+#include "y720-i18n.h"
 
 #include <string.h>
 
@@ -142,9 +143,9 @@ Y720ProfileStore *y720_profiles_load(void)
         const gint bright3[4] = {3, 3, 3, 3};
         const gint off[4] = {0, 0, 0, 0};
         const gint off_bright[4] = {0, 0, 0, 0};
-        add_default(store, "方案 1", "static", red, bright);
-        add_default(store, "方案 2", "breath", blue, bright);
-        add_default(store, "方案 3", "wave", purple, bright3);
+        add_default(store, y720_tr("方案 1"), "static", red, bright);
+        add_default(store, y720_tr("方案 2"), "breath", blue, bright);
+        add_default(store, y720_tr("方案 3"), "wave", purple, bright3);
         add_default(store, OFF_PROFILE_NAME, "static", off, off_bright);
         store->selected = 0;
     }
@@ -230,6 +231,14 @@ const gchar *y720_profiles_name(Y720ProfileStore *store, guint index)
     return g_ptr_array_index(store->names, index);
 }
 
+const gchar *y720_profiles_display_name(Y720ProfileStore *store, guint index)
+{
+    const gchar *name = y720_profiles_name(store, index);
+    /* The reserved off profile is UI text; persisted/renamed profiles are user
+     * data, even when their names happen to match a translation key. */
+    return y720_profiles_is_off(store, index) ? y720_tr(OFF_PROFILE_NAME) : name;
+}
+
 void y720_profiles_get(Y720ProfileStore *store, guint index, Y720BacklightProfile *profile)
 {
     if (index >= store->profiles->len) {
@@ -249,12 +258,28 @@ void y720_profiles_set(Y720ProfileStore *store, guint index, const Y720Backlight
 guint y720_profiles_add(Y720ProfileStore *store, const Y720BacklightProfile *profile)
 {
     gint number = (gint)store->profiles->len + 1;
-    gchar *name = g_strdup_printf("方案 %d", number);
+    gchar *name = g_strdup_printf(y720_tr("方案 %d"), number);
     g_ptr_array_add(store->names, name);
     Y720BacklightProfile *copy = g_new0(Y720BacklightProfile, 1);
     y720_backlight_profile_copy(copy, profile);
     g_ptr_array_add(store->profiles, copy);
     return store->profiles->len - 1;
+}
+
+gboolean y720_profiles_rename(Y720ProfileStore *store, guint index, const gchar *name)
+{
+    if (!store || index >= store->profiles->len || !name || !*name)
+        return FALSE;
+    if (y720_profiles_is_off(store, index))
+        return FALSE;
+    gchar *trimmed = g_strstrip(g_strdup(name));
+    if (!*trimmed) {
+        g_free(trimmed);
+        return FALSE;
+    }
+    g_free(g_ptr_array_index(store->names, index));
+    g_ptr_array_index(store->names, index) = trimmed;
+    return TRUE;
 }
 
 gboolean y720_profiles_remove(Y720ProfileStore *store, guint index)

@@ -6,10 +6,14 @@
 
 G_BEGIN_DECLS
 
+#define Y720_DEFAULT_PROFILE_HOTKEY "evdev:228"
+#define Y720_DEFAULT_BOOST_HOTKEY "<Control><Shift>0"
+
 typedef struct {
     gboolean start_hidden;
     gboolean close_to_tray;
     gboolean global_hotkey;
+    gchar *language;
     gboolean has_profile;
     Y720BacklightProfile profile;
 
@@ -27,6 +31,8 @@ typedef struct {
 Y720Settings *y720_settings_new(void);
 void y720_settings_free(Y720Settings *settings);
 void y720_settings_save(const Y720Settings *settings);
+/* Apply the same shifted-number compatibility on load and immediately after recording. */
+void y720_settings_normalize_shortcuts(Y720Settings *settings);
 void y720_settings_set_profile(Y720Settings *settings, const Y720BacklightProfile *profile);
 
 gboolean y720_autostart_enabled(void);

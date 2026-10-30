@@ -7,9 +7,52 @@
 #define Y720_MAX_RPM 5100
 #define Y720_STEP_RPM 100
 #define Y720_CPU_LIMIT_MC 85000
-#define Y720_GPU_LIMIT_MC 80000
+
 #define Y720_TARGET_INTERVAL_SECONDS 15
 #define Y720_RAMP_SECONDS 5
+#define Y720_CURVE_POINTS 6
+#define Y720_THERMAL_STATES 50
+#define Y720_THERMAL_HYST_MC 2000
+
+
+
+/* Fixed temperature knots: 40, 50, 60, 70, 80, 90 degrees C.
+ * Pure integer interpolation, then round upward to a supported RPM step. */
+static inline int y720_curve_valid(const unsigned int points[Y720_CURVE_POINTS])
+{
+	unsigned int i;
+	for (i = 0; i < Y720_CURVE_POINTS; i++)
+		if (points[i] < Y720_MIN_RPM || points[i] > Y720_MAX_RPM || points[i] % Y720_STEP_RPM)
+			return 0;
+		else if (i && points[i] < points[i - 1])
+			return 0;
+	return 1;
+}
+
+static inline unsigned int y720_thermal_state(int temp_mc)
+{
+	if (temp_mc <= 40000)
+		return 0;
+	if (temp_mc >= 90000)
+		return Y720_THERMAL_STATES;
+	return (temp_mc - 40000) / 1000;
+}
+
+static inline unsigned int y720_curve_rpm(const unsigned int points[Y720_CURVE_POINTS], int temp_mc)
+{
+	unsigned int i, rpm;
+	int delta, scaled;
+	if (temp_mc <= 40000)
+		return points[0];
+	if (temp_mc >= 90000)
+		return points[Y720_CURVE_POINTS - 1];
+	i = (temp_mc - 40000) / 10000;
+	delta = (int)points[i + 1] - (int)points[i];
+	/* Validated thermal profiles are nondecreasing. */
+	scaled = delta * (temp_mc - 40000 - (int)i * 10000);
+	rpm = (int)points[i] + (scaled >= 0 ? (scaled + 9999) / 10000 : scaled / 10000);
+	return ((rpm + Y720_STEP_RPM - 1) / Y720_STEP_RPM) * Y720_STEP_RPM;
+}
 
 enum y720_temperature_state { Y720_TEMP_OK, Y720_TEMP_INVALID, Y720_TEMP_HOT };
 
@@ -26,16 +69,7 @@ static inline enum y720_temperature_state y720_cpu_health(int temp_mc)
 	return temp_mc >= Y720_CPU_LIMIT_MC ? Y720_TEMP_HOT : Y720_TEMP_OK;
 }
 
-static inline enum y720_temperature_state y720_gpu_health(int awake,
-	unsigned int raw, unsigned int average, unsigned int errors, unsigned int failures)
-{
-	if (!awake)
-		return Y720_TEMP_OK;
-	if (!raw || raw > 120 || !average || average > 120 || (errors & 2) || failures)
-		return Y720_TEMP_INVALID;
-	return raw * 1000 >= Y720_GPU_LIMIT_MC || average * 1000 >= Y720_GPU_LIMIT_MC ?
-		Y720_TEMP_HOT : Y720_TEMP_OK;
-}
+
 
 static inline int y720_target_due(unsigned int desired, unsigned int applied,
 				unsigned int elapsed_seconds, unsigned int stable_seconds)

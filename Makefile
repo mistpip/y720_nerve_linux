@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 KDIR ?= /lib/modules/$(shell uname -r)/build
+PREFIX ?= /usr/local
 .PHONY: all cli gui modules test clean
 all: cli
 cli:
 	$(MAKE) -C userspace
 gui:
-	meson setup gui/build gui --prefix=/usr/local
+	@if test -f gui/build/build.ninja; then meson setup --reconfigure gui/build gui --prefix="$(PREFIX)"; else meson setup gui/build gui --prefix="$(PREFIX)"; fi
 	ninja -C gui/build
 modules:
 	$(MAKE) -C fan/kernel KDIR=$(KDIR)

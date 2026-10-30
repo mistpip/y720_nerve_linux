@@ -1,6 +1,9 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
 set -euo pipefail
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+version=$(cat "$root/VERSION")
+case "$version" in ''|*[!a-zA-Z0-9.+:~_-]*) exit 2 ;; esac
 action=${1:-}
 kernel_release=${2:-}
 case "$action" in --check|--install) ;; *) echo 'Internal usage: --check|--install KERNEL' >&2; exit 2 ;; esac
@@ -15,9 +18,8 @@ if grep -q '^CONFIG_CC_IS_CLANG=y' "/lib/modules/$kernel_release/build/.config";
 else
     command -v gcc >/dev/null || { echo 'Missing matching GCC toolchain.' >&2; exit 1; }
 fi
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 for module in y720-cooling y720-hid; do
-    for destination in "/usr/src/$module-0.1" "/var/lib/dkms/$module/0.1"; do
+    for destination in "/usr/src/$module-$version" "/var/lib/dkms/$module/$version"; do
         if test -e "$destination" || test -L "$destination"; then
             echo "Refusing to overwrite $destination. Inspect/remove the previous registration explicitly." >&2
             exit 1
@@ -28,20 +30,21 @@ test "$action" = --install || exit 0
 for component in fan keyboard; do
     if test "$component" = fan; then
         module=y720-cooling
-        sources=(y720_cooling.c y720-native.h y720-fan-policy.h)
+        sources=(y720_cooling.c y720-native.h y720-fan-policy.h y720-thermal.h)
     else
         module=y720-hid
         sources=(y720_hid.c y720-mapping.h)
     fi
-    destination="/usr/src/$module-0.1"
+    destination="/usr/src/$module-$version"
     install -d "$destination/kernel"
     install -m644 "$root/$component/dkms.conf" "$destination/dkms.conf"
+    install -m644 "$root/VERSION" "$destination/VERSION"
     install -m644 "$root/$component/kernel/Makefile" "$destination/kernel/Makefile"
     install -m644 "$root/LICENSES/GPL-2.0.txt" "$destination/kernel/COPYING"
     for name in "${sources[@]}"; do install -m644 "$root/$component/kernel/$name" "$destination/kernel/$name"; done
-    dkms add -m "$module" -v 0.1
-    dkms build -m "$module" -v 0.1 -k "$kernel_release"
-    dkms install -m "$module" -v 0.1 -k "$kernel_release"
+    dkms add -m "$module" -v "$version"
+    dkms build -m "$module" -v "$version" -k "$kernel_release"
+    dkms install -m "$module" -v "$version" -k "$kernel_release"
 done
 # No automatic cleanup on failure: retain partial DKMS state for explicit inspection.
 # No modprobe, initramfs rebuild, vendor replacement, or modules-load configuration.

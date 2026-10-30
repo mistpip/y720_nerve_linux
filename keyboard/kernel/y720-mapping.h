@@ -39,6 +39,9 @@ static inline unsigned int y720_lookup_key(unsigned int usage, bool map_record)
 {
 	switch (usage) {
 	case 0x000c0050: return KEY_KBDILLUMTOGGLE;
+	/* Firmware emits this on keypad 7 with NumLock OFF, not on Fn+7.
+	 * NumLock ON emits keyboard usage 0x7005f; leave that path untouched.
+	 */
 	case 0x000c0053: return KEY_PROG1;
 	case 0x000c0054: return KEY_MICMUTE;
 	case 0x000c0057: return KEY_CAMERA_ACCESS_TOGGLE;

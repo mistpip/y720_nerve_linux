@@ -3,6 +3,8 @@
 # Remove matching release files only. Modules must already be unloaded explicitly.
 set -euo pipefail
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+version=$(cat "$root/VERSION")
+case "$version" in ''|*[!a-zA-Z0-9.+:~_-]*) exit 2 ;; esac
 selection=cli
 prefix=/usr/local
 while (($#)); do
@@ -27,6 +29,7 @@ case "$selection" in
     gui) want_gui=1 ;;
 esac
 if test "$want_cli" = 1; then sh "$root/userspace/uninstall.sh" "$prefix" --check; fi
+if test "$want_gui" = 1; then bash "$root/scripts/install-gui.sh" --remove-check "$prefix"; fi
 if test "$want_drivers" = 1; then
     test "$(id -u)" = 0 || { echo 'Run driver removal with sudo.' >&2; exit 1; }
     command -v dkms >/dev/null
@@ -40,15 +43,10 @@ fi
 if test "$want_cli" = 1; then sh "$root/userspace/uninstall.sh" "$prefix"; fi
 if test "$want_drivers" = 1; then
     for module in y720-cooling y720-hid; do
-        if test -e "/var/lib/dkms/$module/0.1"; then dkms remove -m "$module" -v 0.1 --all; fi
+        if test -e "/var/lib/dkms/$module/$version"; then dkms remove -m "$module" -v "$version" --all; fi
     done
 fi
 if test "$want_gui" = 1; then
-    rm -f "$prefix/bin/y720-control"
-    rm -f "$prefix/share/applications/org.y720.Control.desktop"
-    rm -f "$prefix/share/icons/hicolor/128x128/apps/org.y720.Control.png"
-    rm -f "$prefix/share/icons/hicolor/256x256/apps/org.y720.Control.png"
-    rm -f "$prefix/share/metainfo/org.y720.Control.metainfo.xml"
-    rm -f /usr/share/polkit-1/actions/org.y720.Control.policy
+    bash "$root/scripts/install-gui.sh" --remove "$prefix"
 fi
 echo 'Removed selected release files/registrations; retained source directories and device settings.'

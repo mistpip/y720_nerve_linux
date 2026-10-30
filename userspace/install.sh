@@ -23,14 +23,14 @@ check() {
 }
 check "$root/userspace/build/y720-fan" "$prefix/bin/y720-fan"
 check "$root/userspace/build/y720-backlight" "$prefix/bin/y720-backlight"
-for name in USERSPACE-DRIVER-API.md CLI.md GUI-INTEGRATION.md C-DEVELOPMENT.md FNF7.md COMPATIBILITY.md; do
+for name in CLI.md DEVELOPMENT.md; do
     check "$root/docs/$name" "$prefix/share/doc/y720-cli/$name"
 done
 test "${2:-}" != --check || exit 0
 install -d "$prefix/bin" "$prefix/share/doc/y720-cli"
 install -m755 "$root/userspace/build/y720-fan" "$prefix/bin/y720-fan"
 install -m755 "$root/userspace/build/y720-backlight" "$prefix/bin/y720-backlight"
-for name in USERSPACE-DRIVER-API.md CLI.md GUI-INTEGRATION.md C-DEVELOPMENT.md FNF7.md COMPATIBILITY.md; do
+for name in CLI.md DEVELOPMENT.md; do
     install -m644 "$root/docs/$name" "$prefix/share/doc/y720-cli/$name"
 done
 echo "Installed y720-fan and y720-backlight under $prefix; no startup or hardware changes."

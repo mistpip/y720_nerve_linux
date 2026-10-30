@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "y720-tray.h"
+#include "y720-i18n.h"
 
 #include <gtk/gtk.h>
 #include <string.h>
@@ -92,7 +93,6 @@ struct _Y720Tray {
 
 enum {
     ITEM_ROOT = 0,
-    ITEM_TOGGLE = 1,
     ITEM_SEP1 = 2,
     ITEM_AUTO = 3,
     ITEM_BOOST = 4,
@@ -102,6 +102,7 @@ enum {
     ITEM_QUIT = 9,
     ITEM_PROFILES = 11,
     ITEM_CURVE = 12,
+    ITEM_STATUS = 13,
     ITEM_PROFILE_BASE = 100,
 };
 
@@ -116,12 +117,14 @@ static void emit_layout_updated(Y720Tray *tray)
 static const gchar *mode_label(const gchar *mode)
 {
     if (g_strcmp0(mode, "auto") == 0)
-        return "自动";
+        return y720_tr("自动");
     if (g_strcmp0(mode, "boost") == 0)
-        return "极致散热";
+        return y720_tr("极致散热");
     if (g_strcmp0(mode, "curve") == 0)
-        return "自定义";
-    return "只读";
+        return y720_tr("曲线");
+    if (g_strcmp0(mode, "custom") == 0)
+        return y720_tr("手动");
+    return y720_tr("只读");
 }
 
 static gboolean mode_is(const Y720Tray *tray, const gchar *mode)
@@ -177,9 +180,9 @@ static GVariant *empty_pixmap(void)
 
 static GVariant *tooltip(Y720Tray *tray)
 {
-    gchar *subtitle = g_strdup_printf("%s · %d RPM", mode_label(tray->mode), tray->rpm);
+    gchar *subtitle = g_strdup_printf("%s  %d RPM", mode_label(tray->mode), tray->rpm);
     GVariant *value = g_variant_new("(s@a(iiay)ss)", "Y720 Nerve Center", empty_pixmap(),
-                                    subtitle, tray->window_visible ? "窗口已显示" : "窗口已隐藏");
+                                    subtitle, y720_tr(tray->window_visible ? "窗口已显示" : "窗口已隐藏"));
     g_free(subtitle);
     return value;
 }
@@ -259,7 +262,7 @@ static GVariant *menu_item(Y720Tray *tray, gint id, GVariant *children)
 
     if (id == ITEM_ROOT || id == ITEM_PROFILES) {
         if (id == ITEM_PROFILES) {
-            add_prop(&props, "label", g_variant_new_string("切换方案"));
+            add_prop(&props, "label", g_variant_new_string(y720_tr("切换方案")));
             add_prop(&props, "enabled", g_variant_new_boolean(TRUE));
             add_prop(&props, "visible", g_variant_new_boolean(TRUE));
         }
@@ -276,26 +279,28 @@ static GVariant *menu_item(Y720Tray *tray, gint id, GVariant *children)
         }
     } else if (id == ITEM_SEP1 || id == ITEM_SEP2 || id == ITEM_SEP3) {
         add_prop(&props, "type", g_variant_new_string("separator"));
-    } else if (id == ITEM_TOGGLE) {
-        add_prop(&props, "label", g_variant_new_string(tray->window_visible ? "隐藏窗口" : "显示窗口"));
-        add_prop(&props, "enabled", g_variant_new_boolean(TRUE));
+    } else if (id == ITEM_STATUS) {
+        gchar *label = g_strdup_printf("%s  %d RPM", mode_label(tray->mode), tray->rpm);
+        add_prop(&props, "label", g_variant_new_string(label));
+        add_prop(&props, "enabled", g_variant_new_boolean(FALSE));
         add_prop(&props, "visible", g_variant_new_boolean(TRUE));
+        g_free(label);
     } else if (id == ITEM_AUTO || id == ITEM_BOOST || id == ITEM_CURVE) {
         gboolean selected = id == ITEM_AUTO ? mode_is(tray, "auto") :
                             id == ITEM_BOOST ? mode_is(tray, "boost") : mode_is(tray, "curve");
-        add_prop(&props, "label", g_variant_new_string(id == ITEM_AUTO ? "自动模式" :
-                                                       id == ITEM_BOOST ? "极致散热" : "曲线模式"));
+        add_prop(&props, "label", g_variant_new_string(y720_tr(id == ITEM_AUTO ? "自动模式" :
+                                                       id == ITEM_BOOST ? "极致散热" : "曲线模式")));
         gboolean curve_hidden = id == ITEM_CURVE && !tray->curve_enabled;
         add_prop(&props, "enabled", g_variant_new_boolean(tray->controls && !curve_hidden));
         add_prop(&props, "visible", g_variant_new_boolean(!curve_hidden));
         add_prop(&props, "toggle-type", g_variant_new_string("radio"));
         add_prop(&props, "toggle-state", g_variant_new_int32(selected ? 1 : 0));
     } else if (id == ITEM_SETTINGS) {
-        add_prop(&props, "label", g_variant_new_string("设置…"));
+        add_prop(&props, "label", g_variant_new_string(y720_tr("设置…")));
         add_prop(&props, "enabled", g_variant_new_boolean(TRUE));
         add_prop(&props, "visible", g_variant_new_boolean(TRUE));
     } else if (id == ITEM_QUIT) {
-        add_prop(&props, "label", g_variant_new_string("退出"));
+        add_prop(&props, "label", g_variant_new_string(y720_tr("退出")));
         add_prop(&props, "enabled", g_variant_new_boolean(TRUE));
         add_prop(&props, "visible", g_variant_new_boolean(TRUE));
     }
@@ -313,7 +318,7 @@ static GVariant *build_menu(Y720Tray *tray)
     GVariantBuilder children;
     g_variant_builder_init(&children, G_VARIANT_TYPE("av"));
 
-    const gint ids[] = {ITEM_TOGGLE, ITEM_SEP1, ITEM_AUTO, ITEM_BOOST, ITEM_CURVE,
+    const gint ids[] = {ITEM_STATUS, ITEM_SEP1, ITEM_AUTO, ITEM_BOOST, ITEM_CURVE,
                         ITEM_SEP2, ITEM_PROFILES, ITEM_SEP3, ITEM_SETTINGS, ITEM_QUIT};
     for (guint i = 0; i < G_N_ELEMENTS(ids); i++) {
         if (ids[i] == ITEM_PROFILES) {
@@ -372,7 +377,7 @@ static GVariant *item_properties(Y720Tray *tray, gint id)
     g_variant_builder_init(&props, G_VARIANT_TYPE("a{sv}"));
     if (id == ITEM_ROOT || id == ITEM_PROFILES) {
         if (id == ITEM_PROFILES) {
-            add_prop(&props, "label", g_variant_new_string("切换方案"));
+            add_prop(&props, "label", g_variant_new_string(y720_tr("切换方案")));
             add_prop(&props, "enabled", g_variant_new_boolean(TRUE));
             add_prop(&props, "visible", g_variant_new_boolean(TRUE));
         }
@@ -389,30 +394,48 @@ static GVariant *item_properties(Y720Tray *tray, gint id)
         }
     } else if (id == ITEM_SEP1 || id == ITEM_SEP2 || id == ITEM_SEP3) {
         add_prop(&props, "type", g_variant_new_string("separator"));
-    } else if (id == ITEM_TOGGLE) {
-        add_prop(&props, "label", g_variant_new_string(tray->window_visible ? "隐藏窗口" : "显示窗口"));
-        add_prop(&props, "enabled", g_variant_new_boolean(TRUE));
+    } else if (id == ITEM_STATUS) {
+        gchar *label = g_strdup_printf("%s  %d RPM", mode_label(tray->mode), tray->rpm);
+        add_prop(&props, "label", g_variant_new_string(label));
+        add_prop(&props, "enabled", g_variant_new_boolean(FALSE));
         add_prop(&props, "visible", g_variant_new_boolean(TRUE));
+        g_free(label);
     } else if (id == ITEM_AUTO || id == ITEM_BOOST || id == ITEM_CURVE) {
         gboolean selected = id == ITEM_AUTO ? mode_is(tray, "auto") :
                             id == ITEM_BOOST ? mode_is(tray, "boost") : mode_is(tray, "curve");
         gboolean curve_hidden = id == ITEM_CURVE && !tray->curve_enabled;
-        add_prop(&props, "label", g_variant_new_string(id == ITEM_AUTO ? "自动模式" :
-                                                       id == ITEM_BOOST ? "极致散热" : "曲线模式"));
+        add_prop(&props, "label", g_variant_new_string(y720_tr(id == ITEM_AUTO ? "自动模式" :
+                                                       id == ITEM_BOOST ? "极致散热" : "曲线模式")));
         add_prop(&props, "enabled", g_variant_new_boolean(tray->controls && !curve_hidden));
         add_prop(&props, "visible", g_variant_new_boolean(!curve_hidden));
         add_prop(&props, "toggle-type", g_variant_new_string("radio"));
         add_prop(&props, "toggle-state", g_variant_new_int32(selected ? 1 : 0));
     } else if (id == ITEM_SETTINGS) {
-        add_prop(&props, "label", g_variant_new_string("设置…"));
+        add_prop(&props, "label", g_variant_new_string(y720_tr("设置…")));
         add_prop(&props, "enabled", g_variant_new_boolean(TRUE));
         add_prop(&props, "visible", g_variant_new_boolean(TRUE));
     } else if (id == ITEM_QUIT) {
-        add_prop(&props, "label", g_variant_new_string("退出"));
+        add_prop(&props, "label", g_variant_new_string(y720_tr("退出")));
         add_prop(&props, "enabled", g_variant_new_boolean(TRUE));
         add_prop(&props, "visible", g_variant_new_boolean(TRUE));
     }
     return g_variant_builder_end(&props);
+}
+
+static gchar *menu_action(Y720Tray *tray, gint32 id, const gchar *event)
+{
+    if (g_strcmp0(event, "clicked"))
+        return NULL;
+    if (id >= ITEM_PROFILE_BASE && (guint)(id - ITEM_PROFILE_BASE) < tray->profiles->len)
+        return g_strdup_printf("profile:%d", id - ITEM_PROFILE_BASE);
+    switch (id) {
+    case ITEM_AUTO: return g_strdup("mode-auto");
+    case ITEM_BOOST: return g_strdup("mode-boost");
+    case ITEM_CURVE: return g_strdup("mode-curve");
+    case ITEM_SETTINGS: return g_strdup("settings");
+    case ITEM_QUIT: return g_strdup("quit");
+    default: return NULL;
+    }
 }
 
 static void menu_method_call(GDBusConnection *connection, const gchar *sender,
@@ -438,7 +461,7 @@ static void menu_method_call(GDBusConnection *connection, const gchar *sender,
         g_variant_builder_init(&result, G_VARIANT_TYPE("a(ia{sv})"));
         if (count == 0) {
             GArray *all = g_array_new(FALSE, FALSE, sizeof(gint));
-            const gint base[] = {ITEM_ROOT, ITEM_TOGGLE, ITEM_SEP1, ITEM_AUTO,
+            const gint base[] = {ITEM_ROOT, ITEM_STATUS, ITEM_SEP1, ITEM_AUTO,
                                  ITEM_BOOST, ITEM_CURVE, ITEM_SEP2, ITEM_PROFILES,
                                  ITEM_SEP3, ITEM_SETTINGS, ITEM_QUIT};
             for (guint i = 0; i < G_N_ELEMENTS(base); i++)
@@ -476,41 +499,51 @@ static void menu_method_call(GDBusConnection *connection, const gchar *sender,
     }
 
     if (g_strcmp0(method_name, "Event") == 0) {
-        gint32 id = g_variant_get_int32(g_variant_get_child_value(parameters, 0));
+        gint32 id;
+        g_variant_get_child(parameters, 0, "i", &id);
         const gchar *event = NULL;
         g_variant_get_child(parameters, 1, "&s", &event);
-        if (g_strcmp0(event, "clicked") == 0) {
-            if (id >= ITEM_PROFILE_BASE) {
-                gchar action_name[32];
-                g_snprintf(action_name, sizeof(action_name), "profile:%d",
-                           id - ITEM_PROFILE_BASE);
-                if (tray->callback)
-                    tray->callback(action_name, tray->user_data);
-                g_dbus_method_invocation_return_value(invocation, NULL);
-                return;
-            }
-            const gchar *action = NULL;
-            switch (id) {
-            case ITEM_TOGGLE: action = "toggle-window"; break;
-            case ITEM_AUTO: action = "mode-auto"; break;
-            case ITEM_BOOST: action = "mode-boost"; break;
-            case ITEM_CURVE: action = "mode-curve"; break;
-            case ITEM_SETTINGS: action = "settings"; break;
-            case ITEM_QUIT: action = "quit"; break;
-            default: break;
-            }
-            if (action && tray->callback)
-                tray->callback(action, tray->user_data);
-        }
+        gchar *action = menu_action(tray, id, event);
+        Y720TrayActionFunc callback = tray->callback;
+        gpointer callback_data = tray->user_data;
+        /* A quit callback may tear down the tray. Acknowledge before calling it. */
         g_dbus_method_invocation_return_value(invocation, NULL);
+        if (action && callback)
+            callback(action, callback_data);
+        g_free(action);
         return;
     }
 
     if (g_strcmp0(method_name, "EventGroup") == 0) {
+        GPtrArray *actions = g_ptr_array_new_with_free_func(g_free);
+        GVariant *events = g_variant_get_child_value(parameters, 0);
+        GVariantIter iter;
+        GVariant *entry;
+        g_variant_iter_init(&iter, events);
+        while ((entry = g_variant_iter_next_value(&iter))) {
+            gint32 id;
+            const gchar *event;
+            g_variant_get_child(entry, 0, "i", &id);
+            g_variant_get_child(entry, 1, "&s", &event);
+            gchar *action = menu_action(tray, id, event);
+            if (action)
+                g_ptr_array_add(actions, action);
+            g_variant_unref(entry);
+        }
+        g_variant_unref(events);
+        Y720TrayActionFunc callback = tray->callback;
+        gpointer callback_data = tray->user_data;
         GVariantBuilder errors;
         g_variant_builder_init(&errors, G_VARIANT_TYPE("ai"));
         g_dbus_method_invocation_return_value(invocation,
             g_variant_new("(@ai)", g_variant_builder_end(&errors)));
+        for (guint i = 0; callback && i < actions->len; i++) {
+            const gchar *action = g_ptr_array_index(actions, i);
+            callback(action, callback_data);
+            if (g_str_equal(action, "quit"))
+                break;
+        }
+        g_ptr_array_unref(actions);
         return;
     }
 

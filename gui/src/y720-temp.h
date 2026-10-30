@@ -3,11 +3,12 @@
 #define Y720_TEMP_H
 
 #include <glib.h>
+#include "y720-models.h"
 
 G_BEGIN_DECLS
 
-/* Maximum CPU/GPU temperature in Celsius; -1 when no sensor is readable. */
-gint y720_temp_read_max(void);
+/* Display the driver's single control temperature, or -1 when unavailable. */
+gint y720_temp_display_from_status(const Y720FanStatus *status);
 
 G_END_DECLS
 

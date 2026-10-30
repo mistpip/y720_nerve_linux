@@ -1,0 +1,2 @@
+# SPDX-License-Identifier: MIT
+option('x11', type: 'feature', value: 'auto', description: 'X11 global shortcut backend')

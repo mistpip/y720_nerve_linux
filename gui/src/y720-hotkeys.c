@@ -1,11 +1,16 @@
 /* SPDX-License-Identifier: MIT */
 #include "y720-hotkeys.h"
+#include "y720-i18n.h"
+#include "y720-portal-hotkeys.h"
 
 #include <gdk/gdk.h>
-#include <gdk/x11/gdkx.h>
 #include <gtk/gtk.h>
 
-#ifdef HAVE_X11
+static Y720PortalHotkeys *portal;
+static gchar *start_error;
+
+#if defined(HAVE_X11) && defined(GDK_WINDOWING_X11)
+#include <gdk/x11/gdkx.h>
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
 #include <X11/Xproto.h>
@@ -73,21 +78,21 @@ static void ungrab_binding(Display *display, Window root, KeyCode keycode, guint
 gboolean y720_hotkeys_start(const Y720HotkeyBinding *bindings, guint count,
                             GError **error)
 {
-#ifdef HAVE_X11
+#if defined(HAVE_X11) && defined(GDK_WINDOWING_X11)
     GdkDisplay *display = gdk_display_get_default();
     if (!display || !GDK_IS_X11_DISPLAY(display)) {
         g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
-                    "全局快捷键仅在 X11 会话可用");
+                    y720_tr("全局快捷键仅在 X11 会话可用"));
         return FALSE;
     }
     if (!bindings || count == 0 || count > MAX_BINDINGS) {
-        g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "快捷键数量无效");
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, y720_tr("快捷键数量无效"));
         return FALSE;
     }
 
     x_display = XOpenDisplay(NULL);
     if (!x_display) {
-        g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "无法打开 X11 显示");
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, y720_tr("无法打开 X11 显示"));
         return FALSE;
     }
 
@@ -96,7 +101,7 @@ gboolean y720_hotkeys_start(const Y720HotkeyBinding *bindings, guint count,
         XCloseDisplay(x_display);
         x_display = NULL;
         g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
-                    "XWayland 会话无法提供全局快捷键");
+                    y720_tr("XWayland 会话无法提供全局快捷键"));
         return FALSE;
     }
 
@@ -109,26 +114,36 @@ gboolean y720_hotkeys_start(const Y720HotkeyBinding *bindings, guint count,
     for (guint i = 0; i < count; i++) {
         guint keyval = 0;
         GdkModifierType gdk_mods = 0;
-        gtk_accelerator_parse(bindings[i].accelerator, &keyval, &gdk_mods);
-        if (!keyval || !bindings[i].callback) {
-            g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "无法解析快捷键");
-            goto fail;
+        KeyCode raw_keycode = 0;
+        if (g_str_has_prefix(bindings[i].accelerator, "keycode:")) {
+            guint parsed = (guint)g_ascii_strtoull(bindings[i].accelerator + 8, NULL, 10);
+            if (parsed == 0 || parsed > 255) {
+                g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, y720_tr("键码无效"));
+                goto fail;
+            }
+            raw_keycode = (KeyCode)parsed;
+        } else {
+            gtk_accelerator_parse(bindings[i].accelerator, &keyval, &gdk_mods);
+            if (!keyval || !bindings[i].callback) {
+                g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, y720_tr("无法解析快捷键"));
+                goto fail;
+            }
         }
-        KeyCode keycode = XKeysymToKeycode(x_display, keyval);
+        KeyCode keycode = raw_keycode ? raw_keycode : XKeysymToKeycode(x_display, keyval);
         guint mods = 0;
         if (gdk_mods & GDK_CONTROL_MASK) mods |= ControlMask;
         if (gdk_mods & GDK_SHIFT_MASK) mods |= ShiftMask;
         if (gdk_mods & GDK_ALT_MASK) mods |= Mod1Mask;
         if (gdk_mods & GDK_SUPER_MASK) mods |= Mod4Mask;
-        if (!keycode || !mods) {
+        if (!keycode) {
             g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
-                        "快捷键需要修饰键");
+                        y720_tr("无法解析键码"));
             goto fail;
         }
         for (guint j = 0; j < x_count; j++) {
             if (x_bindings[j].keycode == keycode && x_bindings[j].mods == mods) {
                 g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
-                            "两个快捷键重复");
+                            y720_tr("两个快捷键重复"));
                 goto fail;
             }
         }
@@ -147,7 +162,7 @@ gboolean y720_hotkeys_start(const Y720HotkeyBinding *bindings, guint count,
     XSetErrorHandler(old_handler);
 
     if (x_grab_failed) {
-        g_set_error(error, G_IO_ERROR, G_IO_ERROR_BUSY, "快捷键已被其他程序占用");
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_BUSY, y720_tr("快捷键已被其他程序占用"));
         goto fail;
     }
 
@@ -168,14 +183,17 @@ fail:
     return FALSE;
 #else
     (void)bindings; (void)count;
-    g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "构建时未启用 X11");
+    g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, y720_tr("构建时未启用 X11"));
     return FALSE;
 #endif
 }
 
 void y720_hotkeys_stop(void)
 {
-#ifdef HAVE_X11
+    y720_portal_hotkeys_stop(portal);
+    g_clear_object(&portal);
+    g_clear_pointer(&start_error, g_free);
+#if defined(HAVE_X11) && defined(GDK_WINDOWING_X11)
     if (x_watch) {
         g_source_remove(x_watch);
         x_watch = 0;
@@ -197,9 +215,31 @@ void y720_hotkeys_stop(void)
 
 gboolean y720_hotkeys_active(void)
 {
-#ifdef HAVE_X11
+    if (portal)
+        return y720_portal_hotkeys_active(portal);
+#if defined(HAVE_X11) && defined(GDK_WINDOWING_X11)
     return x_display != NULL;
 #else
     return FALSE;
 #endif
+}
+
+gboolean y720_hotkeys_start_portal(const Y720PortalBinding *bindings, guint count,
+                                  GObject *owner, Y720HotkeyStateFunc changed, GError **error)
+{
+    y720_hotkeys_stop();
+    portal = y720_portal_hotkeys_new(bindings, count, owner, changed, error);
+    if (!portal && error && *error)
+        start_error = g_strdup((*error)->message);
+    return portal != NULL; /* Queued, not yet authorized; status remains pending. */
+}
+
+const gchar *y720_hotkeys_status(void)
+{
+    if (portal)
+        return y720_portal_hotkeys_status(portal);
+    if (start_error)
+        return start_error;
+    return y720_tr(y720_hotkeys_active() ? "X11 全局组合键已启用" :
+                                          "普通组合键未注册，检查桌面支持或快捷键占用");
 }

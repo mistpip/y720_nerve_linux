@@ -1,14 +1,20 @@
 /* SPDX-License-Identifier: MIT */
 #include "y720-app.h"
+#include "y720-i18n.h"
 
 #include <gdk/gdk.h>
+#if defined(HAVE_X11) && defined(GDK_WINDOWING_X11)
 #include <gdk/x11/gdkx.h>
+#endif
 #include <graphene.h>
 
 #include "y720-hotkeys.h"
+#include "y720-portal-hotkeys.h"
+#include "y720-evdev.h"
 #include "y720-settings.h"
 #include "y720-tray.h"
 #include "y720-window.h"
+#include "y720-cli.h"
 
 struct _Y720App {
     AdwApplication parent_instance;
@@ -20,7 +26,10 @@ struct _Y720App {
     gboolean quitting;
     gboolean tray_available;
     gboolean hotkey_ok;
+    gboolean held;
     gboolean x11_session;
+    guint quit_wait;
+    gint64 quit_deadline;
     gchar *screenshot_path;
     gchar *screenshot_page;
     gint screenshot_attempts;
@@ -28,9 +37,18 @@ struct _Y720App {
 
 G_DEFINE_TYPE(Y720App, y720_app, ADW_TYPE_APPLICATION)
 
+static void set_accels(Y720App *self);
+
+static void on_hotkey_state(GObject *owner)
+{
+    Y720App *self = Y720_APP(owner);
+    if (!self->quitting)
+        set_accels(self);
+}
+
 static void update_tray(Y720App *self)
 {
-    if (!self->tray || !self->window)
+    if (self->quitting || !self->tray || !self->window)
         return;
     guint count = y720_window_profile_count(self->window);
     const gchar **names = g_new0(const gchar *, count + 1);
@@ -50,6 +68,8 @@ static void update_tray(Y720App *self)
 static void on_tray_action(const gchar *action, gpointer user_data)
 {
     Y720App *self = Y720_APP(user_data);
+    if (self->quitting)
+        return;
     if (g_strcmp0(action, "toggle-window") == 0) {
         gboolean visible = gtk_widget_get_visible(GTK_WIDGET(self->window));
         gtk_widget_set_visible(GTK_WIDGET(self->window), !visible);
@@ -84,16 +104,61 @@ static void on_profile_hotkey(gpointer user_data)
 static void on_boost_hotkey(gpointer user_data)
 {
     Y720App *self = Y720_APP(user_data);
-    g_action_group_activate_action(G_ACTION_GROUP(self), "fan-boost", NULL);
+    g_action_group_activate_action(G_ACTION_GROUP(self), "fan-toggle", NULL);
+}
+
+static void on_launcher_hotkey(gpointer user_data)
+{
+    Y720App *self = Y720_APP(user_data);
+    if (self->window && !self->quitting) {
+        g_debug("Y720 launcher: presenting existing window");
+        gtk_window_present(GTK_WINDOW(self->window));
+    }
 }
 
 static gboolean start_hotkeys(Y720App *self, GError **error)
 {
-    Y720HotkeyBinding bindings[] = {
-        {self->settings->profile_hotkey, on_profile_hotkey, self},
-        {self->settings->boost_hotkey, on_boost_hotkey, self},
-    };
-    return y720_hotkeys_start(bindings, G_N_ELEMENTS(bindings), error);
+    Y720HotkeyBinding x11[2];
+    Y720PortalBinding portal[2];
+    Y720HotkeyBinding evdev[3];
+    guint x11_count = 0, evdev_count = 0;
+
+    /* The firmware's NumLock-off launcher, never the numeric KEY_KP7. */
+    evdev[evdev_count++] = (Y720HotkeyBinding){"evdev:148", on_launcher_hotkey, self};
+
+    const gchar *accels[] = {self->settings->profile_hotkey, self->settings->boost_hotkey};
+    Y720HotkeyFunc callbacks[] = {on_profile_hotkey, on_boost_hotkey};
+    const gchar *ids[] = {"light-next", "fan-toggle"};
+    const gchar *descriptions[] = {y720_tr("切换灯光方案"), y720_tr("切换 auto/boost")};
+    for (guint i = 0; i < 2; i++) {
+        if (!accels[i] || !*accels[i])
+            continue;
+        Y720HotkeyBinding b = {accels[i], callbacks[i], self};
+        if (g_str_has_prefix(accels[i], "evdev:"))
+            evdev[evdev_count++] = b;
+        else {
+            portal[x11_count] = (Y720PortalBinding){ids[i], descriptions[i], accels[i], callbacks[i]};
+            x11[x11_count++] = b;
+        }
+    }
+
+    gboolean ok = TRUE;
+    y720_hotkeys_stop();
+    y720_evdev_stop();
+    if (x11_count > 0 && self->x11_session && !y720_hotkeys_start(x11, x11_count, error))
+        ok = FALSE;
+    if (x11_count > 0 && !self->x11_session &&
+        !y720_hotkeys_start_portal(portal, x11_count, G_OBJECT(self), on_hotkey_state, error))
+        ok = FALSE;
+    GError *evdev_error = NULL;
+    if (evdev_count > 0 && !y720_evdev_start(evdev, evdev_count, &evdev_error)) {
+        ok = FALSE;
+        if (error && !*error)
+            g_propagate_error(error, evdev_error);
+        else
+            g_clear_error(&evdev_error);
+    }
+    return ok;
 }
 
 static void on_fan_status_changed(Y720Window *window, gpointer user_data)
@@ -114,18 +179,51 @@ static void on_visibility_changed(Y720Window *window, gpointer user_data)
     update_tray(Y720_APP(user_data));
 }
 
+static gboolean finish_quit(gpointer user_data)
+{
+    Y720App *self = Y720_APP(user_data);
+    if (y720_cli_has_pending() && g_get_monotonic_time() < self->quit_deadline)
+        return G_SOURCE_CONTINUE;
+    if (y720_cli_has_pending())
+        g_warning("CLI cancellation did not finish before the shutdown deadline");
+    self->quit_wait = 0;
+    if (self->held) {
+        g_application_release(G_APPLICATION(self));
+        self->held = FALSE;
+    }
+    g_application_quit(G_APPLICATION(self));
+    return G_SOURCE_REMOVE;
+}
+
 static void action_quit(GSimpleAction *action, GVariant *parameter, gpointer user_data)
 {
     (void)action; (void)parameter;
     Y720App *self = Y720_APP(user_data);
+    if (self->quitting)
+        return;
     self->quitting = TRUE;
-    y720_window_set_quitting(self->window);
-    y720_hotkeys_stop();
-    if (self->tray) {
-        y720_tray_free(self->tray);
-        self->tray = NULL;
+    gchar **actions = g_action_group_list_actions(G_ACTION_GROUP(self));
+    for (guint i = 0; actions[i]; i++) {
+        GAction *entry = g_action_map_lookup_action(G_ACTION_MAP(self), actions[i]);
+        if (G_IS_SIMPLE_ACTION(entry))
+            g_simple_action_set_enabled(G_SIMPLE_ACTION(entry), FALSE);
     }
-    g_application_quit(G_APPLICATION(self));
+    g_strfreev(actions);
+    if (!self->held) {
+        g_application_hold(G_APPLICATION(self));
+        self->held = TRUE;
+    }
+    if (self->window) {
+        y720_window_set_quitting(self->window);
+        gtk_window_destroy(GTK_WINDOW(self->window));
+    }
+    y720_hotkeys_stop();
+    y720_evdev_capture_stop();
+    y720_evdev_stop();
+    y720_cli_cancel_all();
+    /* Free the tray in shutdown, not inside its own D-Bus event callback. */
+    self->quit_deadline = g_get_monotonic_time() + 3000000;
+    self->quit_wait = g_timeout_add(25, finish_quit, self);
 }
 
 static void action_show(GSimpleAction *action, GVariant *parameter, gpointer user_data)
@@ -223,7 +321,7 @@ static void action_autostart(GSimpleAction *action, GVariant *parameter, gpointe
         y720_window_show_toast(self->window, error->message);
         g_error_free(error);
     } else {
-        y720_window_show_toast(self->window, active ? "已关闭开机启动" : "已设置开机启动");
+        y720_window_show_toast(self->window, y720_tr(active ? "已关闭开机启动" : "已设置开机启动"));
     }
 }
 
@@ -246,6 +344,13 @@ static const GActionEntry app_entries[] = {
 
 static void set_accels(Y720App *self)
 {
+    /* A compositor may still deliver an event locally. Never execute a portal
+     * shortcut twice, or use the preferred binding after the desktop remaps it.
+     * With globals enabled on Wayland, ordinary combos belong to the portal. */
+    const gchar *empty[] = {NULL};
+    gtk_application_set_accels_for_action(GTK_APPLICATION(self), "app.light-next", empty);
+    gtk_application_set_accels_for_action(GTK_APPLICATION(self), "app.fan-toggle", empty);
+    gboolean local_combos = self->x11_session || !self->settings->global_hotkey;
     struct { const gchar *action; const gchar *accel; } table[] = {
         {"app.quit", "<Control>q"},
         {"app.settings", "<Control>comma"},
@@ -256,15 +361,19 @@ static void set_accels(Y720App *self)
         {"app.hide", "<Control>w"},
         {"app.about", "F1"},
     };
-    if (self->settings->profile_hotkey) {
+    if (local_combos && self->settings->profile_hotkey &&
+        !g_str_has_prefix(self->settings->profile_hotkey, "keycode:") &&
+        !g_str_has_prefix(self->settings->profile_hotkey, "evdev:")) {
         const gchar *profile_accels[] = {self->settings->profile_hotkey, NULL};
         gtk_application_set_accels_for_action(GTK_APPLICATION(self),
                                               "app.light-next", profile_accels);
     }
-    if (self->settings->boost_hotkey) {
+    if (local_combos && self->settings->boost_hotkey &&
+        !g_str_has_prefix(self->settings->boost_hotkey, "keycode:") &&
+        !g_str_has_prefix(self->settings->boost_hotkey, "evdev:")) {
         const gchar *boost_accels[] = {self->settings->boost_hotkey, NULL};
         gtk_application_set_accels_for_action(GTK_APPLICATION(self),
-                                              "app.fan-boost", boost_accels);
+                                              "app.fan-toggle", boost_accels);
     }
     for (guint i = 0; i < G_N_ELEMENTS(table); i++) {
         const gchar *accels[] = {table[i].accel, NULL};
@@ -286,19 +395,25 @@ static void y720_app_startup(GApplication *application)
     if (display) {
         gtk_style_context_add_provider_for_display(display, GTK_STYLE_PROVIDER(provider),
             GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        GtkIconTheme *icons = gtk_icon_theme_get_for_display(display);
+        gtk_icon_theme_add_resource_path(icons, "/org/y720/Control/icons");
     }
     g_object_unref(provider);
 
     self->settings = y720_settings_new();
-    self->x11_session = display && GDK_IS_X11_DISPLAY(display);
+    y720_i18n_set_language(self->settings->language);
+#if defined(HAVE_X11) && defined(GDK_WINDOWING_X11)
+    self->x11_session = display && GDK_IS_X11_DISPLAY(display) &&
+                         g_strcmp0(g_getenv("XDG_SESSION_TYPE"), "wayland") != 0;
+#endif
     AdwStyleManager *style = adw_style_manager_get_default();
-    adw_style_manager_set_color_scheme(style, ADW_COLOR_SCHEME_FORCE_DARK);
+    adw_style_manager_set_color_scheme(style, ADW_COLOR_SCHEME_DEFAULT);
 
     g_action_map_add_action_entries(G_ACTION_MAP(application), app_entries,
                                     G_N_ELEMENTS(app_entries), self);
     set_accels(self);
 
-    if (self->settings->global_hotkey && self->x11_session) {
+    if (self->settings->global_hotkey) {
         GError *error = NULL;
         self->hotkey_ok = start_hotkeys(self, &error);
         if (!self->hotkey_ok) {
@@ -368,6 +483,8 @@ static gboolean render_window(gpointer user_data)
 static void y720_app_activate(GApplication *application)
 {
     Y720App *self = Y720_APP(application);
+    if (self->quitting)
+        return;
     if (self->window) {
         self->hidden = FALSE;
         gtk_window_present(GTK_WINDOW(self->window));
@@ -382,6 +499,10 @@ static void y720_app_activate(GApplication *application)
         if (!self->tray_available) {
             y720_tray_free(self->tray);
             self->tray = NULL;
+        } else {
+            /* Closing a transient settings window must not end a tray app. */
+            g_application_hold(application);
+            self->held = TRUE;
         }
         g_object_unref(bus);
     } else {
@@ -391,6 +512,7 @@ static void y720_app_activate(GApplication *application)
 
     self->window = y720_window_new(ADW_APPLICATION(application), self->settings,
                                    self->tray_available, self->hotkey_ok, self->x11_session);
+    g_object_add_weak_pointer(G_OBJECT(self->window), (gpointer *)&self->window);
     g_signal_connect(self->window, "fan-status", G_CALLBACK(on_fan_status_changed), self);
     g_signal_connect(self->window, "visibility-changed", G_CALLBACK(on_visibility_changed), self);
     g_signal_connect(self->window, "profiles-changed", G_CALLBACK(on_profiles_changed), self);
@@ -417,9 +539,12 @@ static void y720_app_activate(GApplication *application)
 
 void y720_app_reload_shortcut(Y720App *self)
 {
+    if (self->quitting)
+        return;
     y720_hotkeys_stop();
+    y720_evdev_stop();
     self->hotkey_ok = FALSE;
-    if (self->settings->global_hotkey && self->x11_session && self->settings->profile_hotkey) {
+    if (self->settings->global_hotkey) {
         GError *error = NULL;
         self->hotkey_ok = start_hotkeys(self, &error);
         if (!self->hotkey_ok) {
@@ -427,18 +552,32 @@ void y720_app_reload_shortcut(Y720App *self)
             g_error_free(error);
         }
     }
-    if (self->settings->profile_hotkey) {
-        const gchar *accels[] = {self->settings->profile_hotkey, NULL};
-        gtk_application_set_accels_for_action(GTK_APPLICATION(self),
-                                              "app.light-next", accels);
-    }
+    const gchar *empty[] = {NULL};
+    gtk_application_set_accels_for_action(GTK_APPLICATION(self), "app.light-next", empty);
+    gtk_application_set_accels_for_action(GTK_APPLICATION(self), "app.fan-toggle", empty);
+    set_accels(self);
     update_tray(self);
 }
 
 static void y720_app_shutdown(GApplication *application)
 {
     Y720App *self = Y720_APP(application);
+    self->quitting = TRUE;
+    if (self->quit_wait) {
+        g_source_remove(self->quit_wait);
+        self->quit_wait = 0;
+    }
     y720_hotkeys_stop();
+    y720_evdev_capture_stop();
+    y720_evdev_stop();
+    if (self->window) {
+        y720_window_set_quitting(self->window);
+        gtk_window_destroy(GTK_WINDOW(self->window));
+    }
+    if (self->held) {
+        g_application_release(G_APPLICATION(self));
+        self->held = FALSE;
+    }
     if (self->tray) {
         y720_tray_free(self->tray);
         self->tray = NULL;

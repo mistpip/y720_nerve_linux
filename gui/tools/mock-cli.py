@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 PROGRAM = "y720-backlight" if Path(sys.argv[0]).name.endswith("backlight") else "y720-fan"
+VERSION = (Path(__file__).resolve().parents[2] / "VERSION").read_text().strip()
 STATE_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "y720-control-mock.json"
 ERROR = os.environ.get("Y720_MOCK_ERROR", "")
 
@@ -22,7 +23,9 @@ ERROR = os.environ.get("Y720_MOCK_ERROR", "")
 def load_state() -> dict:
     defaults = {
         "mode": "auto",
-        "target": 0,
+        "target": 1500,
+        "kernel_curve_active": False,
+        "curve_points": [1500, 1800, 2400, 3200, 4200, 5100],
         "mode_writes": 12,
         "target_writes": 3,
         "ramp_low": 0,
@@ -47,7 +50,7 @@ def emit(data: dict) -> None:
     print(json.dumps({
         "schema_version": 1,
         "program": PROGRAM,
-        "version": "0.1",
+        "version": VERSION,
         "ok": True,
         "data": data,
     }, ensure_ascii=False))
@@ -58,7 +61,7 @@ def fail(code: str, message: str, status: int, details: dict | None = None) -> N
     print(json.dumps({
         "schema_version": 1,
         "program": PROGRAM,
-        "version": "0.1",
+        "version": VERSION,
         "ok": False,
         "error": {"code": code, "message": message, "details": details or {}},
     }, ensure_ascii=False), file=sys.stderr)
@@ -83,13 +86,25 @@ def fan_status(state: dict) -> dict:
         rpm = [1790 + random.randint(-15, 15), 1760 + random.randint(-15, 15)]
     return {
         "device": "hwmon6",
-        "driver_version": "0.4.2",
+        "driver_version": VERSION,
         "controls_available": controls,
         "mode": mode if controls else None,
-        "mode_raw": {"boost": 0, "curve": 1, "auto": 2}.get(mode) if controls else None,
+        "mode_raw": (3 if state["kernel_curve_active"] else {"boost": 0, "curve": 1, "auto": 2}.get(mode)) if controls else None,
         "target_rpm": target if controls else None,
         "pwm": (max(0, min(255, (target - 1500) * 255 // 3600)) if controls else None),
         "fan_rpm": rpm,
+        "temperature": {
+            "millidegrees": 55000,
+            "source": "x86_pkg_temp",
+        },
+        "kernel_curve": {
+            "supported": controls,
+            "active": state["kernel_curve_active"] and controls,
+            "engine": "linux-thermal" if controls else None,
+            "error": 0,
+            "points": state["curve_points"],
+            "temperature_millidegrees": 55000 if state["kernel_curve_active"] else None,
+        },
         "diagnostics": {
             "requested_mode": {"boost": 0, "curve": 1, "auto": 2}.get(mode) if controls else -1,
             "safety_fault": 0,
@@ -127,11 +142,33 @@ def fan(args: list[str]) -> None:
     if command == "status":
         emit(fan_status(state))
 
+    if command == "curve":
+        if ERROR == "read_only":
+            fail("unsupported_version", "Kernel curve unavailable", 3)
+        if filtered == ["curve", "apply", "-"]:
+            try:
+                points = [int(v) for v in sys.stdin.read(128).split()]
+                if len(points) != 6 or any(v < 1500 or v > 5100 or v % 100 for v in points) or points != sorted(points):
+                    raise ValueError()
+            except ValueError:
+                fail("usage", "Expected six nondecreasing RPM values", 2)
+            state["curve_points"] = points
+            state["kernel_curve_active"] = True
+            state["mode"] = "curve"
+            state["target"] = ((points[1] + points[2] + 199) // 200) * 100
+        elif filtered == ["curve", "stop"]:
+            state["kernel_curve_active"] = False
+        else:
+            fail("usage", "Expected curve apply - or curve stop", 2)
+        save_state(state)
+        emit({"operation": "curve", "status": fan_status(state), "settled": False})
+
     if command == "mode":
         mode = filtered[1] if len(filtered) > 1 else ""
         if mode not in ("auto", "boost"):
             fail("usage", "mode requires auto or boost", 2)
         state["mode"] = mode
+        state["kernel_curve_active"] = False
         state["target"] = 0
         state["mode_writes"] += 1
         save_state(state)
@@ -151,6 +188,7 @@ def fan(args: list[str]) -> None:
         rpm = ((rpm + 99) // 100) * 100
         rpm = max(1500, min(5100, rpm))
         state["mode"] = "curve"
+        state["kernel_curve_active"] = False
         state["target"] = rpm
         state["target_writes"] += 1
         save_state(state)

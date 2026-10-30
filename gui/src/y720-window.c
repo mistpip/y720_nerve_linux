@@ -3,10 +3,12 @@
 #include "y720-window.h"
 
 #include <gdk-pixbuf/gdk-pixbuf.h>
+#include <gdk/x11/gdkx.h>
 
 #include "y720-backlight-page.h"
 #include "y720-fan-page.h"
 #include "y720-settings-dialog.h"
+#include "y720-i18n.h"
 
 struct _Y720Window {
     AdwApplicationWindow parent_instance;
@@ -21,10 +23,10 @@ struct _Y720Window {
     GtkWidget *toast_overlay;
     GtkWidget *fan_page;
     GtkWidget *backlight_page;
-    GtkWindow *settings_dialog;
     GtkWidget *background_picture;
-    GtkCssProvider *appearance_provider;
     gchar *loaded_background;
+    AdwDialog *settings_dialog;
+    GtkCssProvider *appearance_provider;
 };
 
 enum {
@@ -73,8 +75,12 @@ static void on_backlight_toast(Y720BacklightPage *page, const gchar *message, gp
 static gboolean on_close_request(GtkWindow *window, gpointer user_data)
 {
     Y720Window *self = Y720_WINDOW(user_data);
-    if (self->quitting || !self->settings->close_to_tray || !self->tray_available)
+    if (self->quitting)
         return FALSE;
+    if (!self->settings->close_to_tray || !self->tray_available) {
+        g_action_group_activate_action(G_ACTION_GROUP(gtk_window_get_application(window)), "quit", NULL);
+        return TRUE;
+    }
 
     gtk_widget_set_visible(GTK_WIDGET(window), FALSE);
     return TRUE;
@@ -112,43 +118,35 @@ static void y720_window_build(Y720Window *self)
                                     self->settings->curve_points);
     self->backlight_page = y720_backlight_page_new();
     adw_view_stack_add_titled_with_icon(ADW_VIEW_STACK(self->stack), self->fan_page,
-                                        "fan", "极致散热", "power-profile-performance-symbolic");
+                                        "fan", y720_tr("极致散热"), "preferences-system-symbolic");
     adw_view_stack_add_titled_with_icon(ADW_VIEW_STACK(self->stack), self->backlight_page,
-                                        "backlight", "幻彩地带", "input-keyboard-symbolic");
+                                        "backlight", y720_tr("幻彩地带"), "input-keyboard-symbolic");
 
     GtkWidget *switcher = adw_view_switcher_new();
     adw_view_switcher_set_stack(ADW_VIEW_SWITCHER(switcher), ADW_VIEW_STACK(self->stack));
     adw_header_bar_set_title_widget(ADW_HEADER_BAR(header), switcher);
 
-    GtkWidget *root = gtk_overlay_new();
-    GtkWidget *backdrop = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_widget_add_css_class(backdrop, "window-backdrop");
-    gtk_widget_set_hexpand(backdrop, TRUE);
-    gtk_widget_set_vexpand(backdrop, TRUE);
-    gtk_widget_set_can_target(backdrop, FALSE);
-    gtk_overlay_set_child(GTK_OVERLAY(root), backdrop);
+    self->toast_overlay = adw_toast_overlay_new();
+    adw_toast_overlay_set_child(ADW_TOAST_OVERLAY(self->toast_overlay), toolbar);
 
+    GtkWidget *root = gtk_overlay_new();
     self->background_picture = gtk_picture_new();
     gtk_picture_set_content_fit(GTK_PICTURE(self->background_picture), GTK_CONTENT_FIT_COVER);
     gtk_widget_set_hexpand(self->background_picture, TRUE);
     gtk_widget_set_vexpand(self->background_picture, TRUE);
-    gtk_widget_set_halign(self->background_picture, GTK_ALIGN_FILL);
-    gtk_widget_set_valign(self->background_picture, GTK_ALIGN_FILL);
     gtk_widget_set_can_target(self->background_picture, FALSE);
     gtk_widget_set_visible(self->background_picture, FALSE);
-    gtk_overlay_add_overlay(GTK_OVERLAY(root), self->background_picture);
-
-    self->toast_overlay = adw_toast_overlay_new();
-    adw_toast_overlay_set_child(ADW_TOAST_OVERLAY(self->toast_overlay), toolbar);
+    gtk_overlay_set_child(GTK_OVERLAY(root), self->background_picture);
     gtk_widget_set_hexpand(self->toast_overlay, TRUE);
     gtk_widget_set_vexpand(self->toast_overlay, TRUE);
     gtk_overlay_add_overlay(GTK_OVERLAY(root), self->toast_overlay);
     adw_application_window_set_content(ADW_APPLICATION_WINDOW(self), root);
 
+
     GMenu *menu = g_menu_new();
-    g_menu_append(menu, "设置…", "app.settings");
-    g_menu_append(menu, "关于 Y720 Nerve Center", "app.about");
-    g_menu_append(menu, "退出", "app.quit");
+    g_menu_append(menu, y720_tr("设置…"), "app.settings");
+    g_menu_append(menu, y720_tr("关于 Y720 Nerve Center"), "app.about");
+    g_menu_append(menu, y720_tr("退出"), "app.quit");
     GtkWidget *menu_button = gtk_menu_button_new();
     gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(menu_button), "open-menu-symbolic");
     gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(menu_button), G_MENU_MODEL(menu));
@@ -168,6 +166,7 @@ static void y720_window_build(Y720Window *self)
     gtk_shortcut_controller_set_scope(GTK_SHORTCUT_CONTROLLER(keys), GTK_SHORTCUT_SCOPE_MANAGED);
     gtk_widget_add_controller(GTK_WIDGET(self), keys);
     y720_window_apply_appearance(self);
+    y720_i18n_apply(GTK_WIDGET(self));
 }
 
 static void y720_window_init(Y720Window *self)
@@ -178,6 +177,7 @@ static void y720_window_init(Y720Window *self)
 static void y720_window_dispose(GObject *object)
 {
     Y720Window *self = Y720_WINDOW(object);
+    g_clear_pointer(&self->loaded_background, g_free);
     if (self->appearance_provider) {
         GdkDisplay *display = gdk_display_get_default();
         if (display)
@@ -185,7 +185,6 @@ static void y720_window_dispose(GObject *object)
                 GTK_STYLE_PROVIDER(self->appearance_provider));
         g_clear_object(&self->appearance_provider);
     }
-    g_clear_pointer(&self->loaded_background, g_free);
     G_OBJECT_CLASS(y720_window_parent_class)->dispose(object);
 }
 
@@ -238,13 +237,11 @@ void y720_window_refresh(Y720Window *self)
 
 void y720_window_set_fan_mode(Y720Window *self, const gchar *mode)
 {
-    y720_fan_page_curve_stop(Y720_FAN_PAGE(self->fan_page));
     y720_fan_page_set_mode(Y720_FAN_PAGE(self->fan_page), mode);
 }
 
 void y720_window_toggle_boost(Y720Window *self)
 {
-    y720_fan_page_curve_stop(Y720_FAN_PAGE(self->fan_page));
     y720_fan_page_toggle_boost(Y720_FAN_PAGE(self->fan_page));
 }
 
@@ -291,7 +288,7 @@ static void on_appearance_changed(gpointer user_data)
     y720_window_apply_appearance(Y720_WINDOW(user_data));
 }
 
-static void on_settings_destroyed(GtkWindow *dialog, gpointer user_data)
+static void on_settings_closed(AdwDialog *dialog, gpointer user_data)
 {
     Y720Window *self = Y720_WINDOW(user_data);
     if (self->settings_dialog == dialog)
@@ -300,15 +297,21 @@ static void on_settings_destroyed(GtkWindow *dialog, gpointer user_data)
 
 void y720_window_show_settings(Y720Window *self)
 {
+    if (self->settings_dialog) {
+        adw_dialog_present(self->settings_dialog, GTK_WIDGET(self));
+        y720_i18n_apply(GTK_WIDGET(self->settings_dialog));
+        return;
+    }
     self->settings_dialog = y720_settings_dialog_show(GTK_WINDOW(self), self->settings,
                                                        self->tray_available, self->hotkey_ok,
                                                        self->x11_session,
                                                        on_appearance_changed, self,
                                                        on_shortcut_changed, self,
                                                        on_curve_setting_changed, self);
-    if (self->settings_dialog)
-        g_signal_connect(self->settings_dialog, "destroy",
-                         G_CALLBACK(on_settings_destroyed), self);
+    g_signal_connect_object(self->settings_dialog, "closed",
+                            G_CALLBACK(on_settings_closed), self, 0);
+    adw_dialog_present(self->settings_dialog, GTK_WIDGET(self));
+    y720_i18n_apply(GTK_WIDGET(self->settings_dialog));
 }
 
 void y720_window_show_toast(Y720Window *self, const gchar *message)
@@ -322,19 +325,16 @@ void y720_window_show_toast(Y720Window *self, const gchar *message)
 
 void y720_window_show_about(Y720Window *self)
 {
-    AdwAboutWindow *about = ADW_ABOUT_WINDOW(adw_about_window_new());
-    adw_about_window_set_application_name(about, "Y720 Nerve Center");
-    adw_about_window_set_application_icon(about, "org.y720.Control");
-    adw_about_window_set_version(about, Y720_VERSION);
-    adw_about_window_set_developer_name(about, "Y720 Linux");
-    adw_about_window_set_comments(about, "极致散热与幻彩地带控制。");
-    adw_about_window_set_website(about,
-        "https://github.com/doublepama10/y720_nerve_linux");
-    adw_about_window_set_license_type(about, GTK_LICENSE_MIT_X11);
-    gtk_widget_add_css_class(GTK_WIDGET(about), "about-opaque");
-    gtk_window_set_transient_for(GTK_WINDOW(about), GTK_WINDOW(self));
-    gtk_window_set_modal(GTK_WINDOW(about), TRUE);
-    gtk_window_present(GTK_WINDOW(about));
+    AdwAboutDialog *about = ADW_ABOUT_DIALOG(adw_about_dialog_new());
+    adw_about_dialog_set_application_name(about, "Y720 Nerve Center");
+    adw_about_dialog_set_application_icon(about, "org.y720.Control");
+    adw_about_dialog_set_version(about, Y720_VERSION);
+    adw_about_dialog_set_developer_name(about, "Y720 Linux");
+    adw_about_dialog_set_comments(about, y720_tr("风扇与键盘背光控制。"));
+    adw_about_dialog_set_website(about,
+        "https://github.com/mistpip/y720_nerve_linux");
+    adw_about_dialog_set_license_type(about, GTK_LICENSE_MIT_X11);
+    adw_dialog_present(ADW_DIALOG(about), GTK_WIDGET(self));
 }
 
 gboolean y720_window_fan_controls(Y720Window *self)
@@ -352,107 +352,65 @@ gint y720_window_fan_rpm(Y720Window *self)
     return y720_fan_page_rpm(Y720_FAN_PAGE(self->fan_page));
 }
 
-static gchar *accent_light(const gchar *accent)
-{
-    GdkRGBA rgba;
-    if (!accent || !gdk_rgba_parse(&rgba, accent))
-        return g_strdup("#ff8a8a");
-    gint r = (gint)((rgba.red * 0.68 + 0.32) * 255);
-    gint g = (gint)((rgba.green * 0.68 + 0.32) * 255);
-    gint b = (gint)((rgba.blue * 0.68 + 0.32) * 255);
-    return g_strdup_printf("#%02x%02x%02x", r, g, b);
-}
-
 void y720_window_apply_appearance(Y720Window *self)
 {
     Y720Settings *settings = self->settings;
     const gchar *path = settings->background_path;
 
-    if (path && *path) {
+    if (path && *path && settings->background_opacity > 0.01) {
         if (g_strcmp0(self->loaded_background, path) != 0) {
             GError *error = NULL;
-            gint source_width = 0, source_height = 0;
-            GdkTexture *texture = NULL;
-            if (gdk_pixbuf_get_file_info(path, &source_width, &source_height)) {
-                gdouble scale = MIN(1.0, MIN(1920.0 / MAX(source_width, 1),
-                                             1200.0 / MAX(source_height, 1)));
-                gint target_width = MAX(1, (gint)(source_width * scale));
-                gint target_height = MAX(1, (gint)(source_height * scale));
-                GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file_at_scale(path, target_width,
-                                                                       target_height, TRUE, &error);
-                if (pixbuf) {
-                    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
-                    texture = gdk_texture_new_for_pixbuf(pixbuf);
-                    G_GNUC_END_IGNORE_DEPRECATIONS
-                    g_object_unref(pixbuf);
-                }
-            } else {
-                g_set_error(&error, G_FILE_ERROR, G_FILE_ERROR_FAILED, "无法读取图片");
-            }
-            if (texture) {
+            GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file_at_scale(path, 1600, 1000, TRUE, &error);
+            if (pixbuf) {
+                GdkTexture *texture;
+                G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+                texture = gdk_texture_new_for_pixbuf(pixbuf);
+                G_GNUC_END_IGNORE_DEPRECATIONS
+                g_object_unref(pixbuf);
                 gtk_picture_set_paintable(GTK_PICTURE(self->background_picture),
                                           GDK_PAINTABLE(texture));
                 g_object_unref(texture);
                 g_free(self->loaded_background);
                 self->loaded_background = g_strdup(path);
-                gtk_widget_set_visible(self->background_picture, TRUE);
             } else {
-                y720_window_show_toast(self, error ? error->message : "无法载入背景图片");
+                g_warning("background: %s", error ? error->message : "load failed");
                 g_clear_error(&error);
                 gtk_widget_set_visible(self->background_picture, FALSE);
-                g_clear_pointer(&self->loaded_background, g_free);
+                gtk_widget_remove_css_class(GTK_WIDGET(self), "has-background");
             }
         }
+        gtk_widget_set_visible(self->background_picture, TRUE);
+        if (fabs(gtk_widget_get_opacity(self->background_picture) - settings->background_opacity) > 0.001)
+            gtk_widget_set_opacity(self->background_picture, settings->background_opacity);
+        gtk_widget_add_css_class(GTK_WIDGET(self), "has-background");
     } else {
         gtk_widget_set_visible(self->background_picture, FALSE);
+        gtk_widget_remove_css_class(GTK_WIDGET(self), "has-background");
         g_clear_pointer(&self->loaded_background, g_free);
     }
-    gtk_widget_set_opacity(self->background_picture, settings->background_opacity);
 
-    GdkRGBA accent_rgba;
-    if (!settings->accent || !gdk_rgba_parse(&accent_rgba, settings->accent))
-        gdk_rgba_parse(&accent_rgba, "#c01c28");
-    gchar *accent = g_strdup_printf("#%02x%02x%02x",
-                                    (gint)(CLAMP(accent_rgba.red, 0.0, 1.0) * 255.0 + 0.5),
-                                    (gint)(CLAMP(accent_rgba.green, 0.0, 1.0) * 255.0 + 0.5),
-                                    (gint)(CLAMP(accent_rgba.blue, 0.0, 1.0) * 255.0 + 0.5));
-    gchar *light = accent_light(accent);
-    gdouble alpha = CLAMP(settings->panel_opacity, 0.35, 1.0);
+    gdouble window_alpha = CLAMP(settings->window_opacity, 0.5, 1.0);
+    if (fabs(gtk_widget_get_opacity(GTK_WIDGET(self)) - window_alpha) > 0.001)
+        gtk_widget_set_opacity(GTK_WIDGET(self), window_alpha);
 
-    GString *css = g_string_new(NULL);
-    g_string_append_printf(css,
-        ":root { --accent-bg-color: %s; --accent-fg-color: #ffffff; --accent-color: %s; }\n",
-        accent, light);
-    gdouble win_alpha = CLAMP(settings->window_opacity, 0.35, 1.0);
-    g_string_append_printf(css,
-        ".window-backdrop { background-color: rgba(11,11,13,%.3f); "
-        "background-image: linear-gradient(135deg, rgba(23,23,29,%.3f) 0%%, "
-        "rgba(10,10,12,%.3f) 58%%, rgba(18,11,13,%.3f) 100%%); }\n",
-        win_alpha, win_alpha, win_alpha, win_alpha);
-    g_string_append_printf(css, "headerbar { background-color: rgba(16,16,19,%.3f); }\n", alpha);
-    g_string_append_printf(css, ".boxed-list, .card { background-color: rgba(23,23,27,%.3f); }\n", alpha);
-    g_string_append_printf(css, ".action-bar { background-color: rgba(11,11,13,%.3f); }\n", alpha);
-    g_string_append_printf(css,
-        "viewswitcher button:checked { background-color: color-mix(in srgb, %s 22%%, transparent); color: %s; }\n",
-        accent, light);
-    g_string_append_printf(css,
-        ".mode-pill { background-color: color-mix(in srgb, %s 22%%, transparent); color: %s; }\n",
-        accent, light);
-    g_string_append_printf(css,
-        ".mode-pill.readonly { background-color: rgba(229,165,10,0.2); color: #e5a50a; }\n");
-    g_free(light);
-    g_free(accent);
+    gdouble panel = CLAMP(settings->panel_opacity, 0.35, 1.0);
+    gchar *css = g_strdup_printf(
+        "window.has-background { background-color: transparent; }\n"
+        "window.has-background headerbar { background-color: color-mix(in srgb, var(--window-bg-color) %.0f%%, transparent); }\n"
+        "window.has-background .boxed-list, window.has-background .card { background-color: color-mix(in srgb, var(--card-bg-color) %.0f%%, transparent); }\n",
+        panel * 100.0, panel * 100.0);
+
 
     GdkDisplay *display = gdk_display_get_default();
     if (self->appearance_provider)
         gtk_style_context_remove_provider_for_display(display,
             GTK_STYLE_PROVIDER(self->appearance_provider));
     self->appearance_provider = gtk_css_provider_new();
-    gtk_css_provider_load_from_string(self->appearance_provider, css->str);
+    gtk_css_provider_load_from_string(self->appearance_provider, css);
     gtk_style_context_add_provider_for_display(display,
         GTK_STYLE_PROVIDER(self->appearance_provider),
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
-    g_string_free(css, TRUE);
+    g_free(css);
 }
 
 void y720_window_set_quitting(Y720Window *self)

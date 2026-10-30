@@ -40,12 +40,9 @@ if test "$want_drivers" = 1; then
     bash "$root/scripts/install-dkms.sh" --check "$kernel_release"
 fi
 if test "$want_gui" = 1; then
-    test -x "$root/gui/build/y720-control" || {
-        echo 'Build the GUI first: make gui' >&2
-        exit 1
-    }
+    bash "$root/scripts/install-gui.sh" --check "$prefix"
 fi
 if test "$want_cli" = 1; then sh "$root/userspace/install.sh" "$prefix"; fi
 if test "$want_drivers" = 1; then bash "$root/scripts/install-dkms.sh" --install "$kernel_release"; fi
-if test "$want_gui" = 1; then meson install -C "$root/gui/build"; fi
+if test "$want_gui" = 1; then bash "$root/scripts/install-gui.sh" --install "$prefix"; fi
 echo 'Installation complete. No modules loaded; no hardware or boot configuration changed.'
